@@ -15,6 +15,7 @@ inline uint64_t u64(const uint8_t *p) {return uint64_t(u32(p)) | uint64_t(u32(p+
 enum class Status : uint32_t { Missing, Valid, Header, Checksum, Blocks, Version, Children, Conflict, Platform };
 struct Port {
     uint32_t type {},dvo {},ddc {},aux {},flags {},capabilities {};
+    uint32_t handle {}; // BDB child device handle (0x0008 = LFP1, 0x0080 = LFP2).
     uint32_t hdmiPreset {UINT32_MAX}; // BDB child byte7, table index; absent firmware uses default.
     // flags preserves byte23 (lane reversal, LSPCON, HPD polarity, lane count).
     // capabilities preserves byte33 (USB-C/TBT capabilities, NOT current mode).
@@ -165,15 +166,22 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,c
         if(b[at]==44){duplicate|=power!=nullptr;power=block;powerSize=n;}
         at+=3+n;
     }
-    if(duplicate || !options || optionsSize<(handle==0x80?2U:1U) ||
-       !edp || edpSize<212 || (ports.version>=232 && (!power || powerSize<56)))return;
-    unsigned internal=PortCount;
+    if(duplicate || !options || !edp || edpSize<212 ||
+       (ports.version>=232 && (!power || powerSize<56)))return;
+    unsigned internal=PortCount,internals=0;
     for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
-        ports.port[d].internal() && ports.port[d].dp()) {
-        if(internal!=PortCount)return; // no guessed panel/connector association
-        internal=d;
+        ports.port[d].internal() && ports.port[d].dp()) {++internals;internal=d;}
+    if(internals>1) {
+        // Some firmware lists both LFP1 and LFP2 (eDP on DDI A and DDI B) although
+        // only one panel is fitted. LFP1 is the primary panel; adopt it only when it
+        // identifies exactly one internal DP port, and use its own options entry.
+        unsigned primary=PortCount,primaries=0;
+        for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
+            ports.port[d].internal() && ports.port[d].dp() && ports.port[d].handle==0x0008) {++primaries;primary=d;}
+        if(primaries!=1)return; // no guessed panel/connector association
+        internal=primary;handle=0x0008;
     }
-    if(internal==PortCount)return;
+    if(internal==PortCount || optionsSize<(handle==0x80?2U:1U))return;
     const auto requested=options[handle==0x80?1:0];
     if(requested>=16 && requested!=0xff)return;
     // No blind profile-zero fallback. Missing identity is usable only if all
@@ -265,7 +273,7 @@ inline Ports parse(const void *data,size_t length,Family family,const uint8_t *i
             r.status=Status::Conflict;return r;
         }
         records[d]=c;if((type&0x1004)==0x1004)panelHandle=u16(c);
-        auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
+        auto &q=r.port[d];q.type=type;q.handle=u16(c);q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
     }
