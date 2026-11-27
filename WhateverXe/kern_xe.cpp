@@ -10303,8 +10303,8 @@ void XE::display13WMArmUpdate(IOService *fb) {
 				directCursor[1]=pipe;directCursor[2]=base;directCursor[3]=index;directCursor[4]=first;directCursor[5]=second;
 				directCursor[6]=observed;directCursor[7]=c.pipe[pipe].wmSurface[1];directCursor[8]=native.valid;directCursor[9]=native.applied;
 				// Capture visibility before the flush to diagnose BASE/SURFLIVE
-				// disagreement. This receipt changes no latch proof.
-				if(Display13FBIRQ::powered(wells,pipe)) {
+				// disagreement. Only needed when publishing N97FBDirectCursorIntent.
+				if(owner && Display13FBIRQ::powered(wells,pipe)) {
 					directCursor[10]=readout.read(0x70080+0x1000*pipe);
 					directCursor[11]=readout.read(0x70088+0x1000*pipe);
 				}
@@ -12611,21 +12611,6 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             }
 			patcher.clearError();
 
-			// Exact donor's post-relocation aux-state writer, before GPU submission.
-			const char *auxState="__ZN15IGAccelResource23fillSurfaceStateAuxInfoEPNS_17ResourceInfoEntryER22SGfxRenderSurfaceState6Intent";
-			const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
-			bool auxAlignOK=size>0x74078 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,auxState,address,size)==address+0x73FC2 &&
-				!memcmp(reinterpret_cast<void *>(address+0x73FC2),auxHead,sizeof(auxHead));
-			if (auxAlignOK) {
-				KernelPatcher::RouteRequest aux[] {{auxState,wrapTGLSurfaceAux,orgTGLSurfaceAux}};
-				auxAlignOK=patcher.routeMultiple(index,aux,arrsize(aux),address,size);
-			}
-			patcher.clearError();
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
-			if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
-			}
 			// Keep IOSurface device-cache allocation uncompressed. The donor
 			// enables it again when the last external display disappears, even
 			// though its CPU-access resolve path can expose compressed bytes.
@@ -12658,6 +12643,25 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				}
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSPolicyReady",iosCCSOK);
+			// Exact donor's post-relocation aux-state writer, before GPU submission.
+			// Skip installing the wrapper when IOSurface CCS is disabled above.
+			bool auxAlignOK=true;
+			if (!iosCCSOK) {
+				const char *auxState="__ZN15IGAccelResource23fillSurfaceStateAuxInfoEPNS_17ResourceInfoEntryER22SGfxRenderSurfaceState6Intent";
+				const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
+				auxAlignOK=size>0x74078 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,auxState,address,size)==address+0x73FC2 &&
+					!memcmp(reinterpret_cast<void *>(address+0x73FC2),auxHead,sizeof(auxHead));
+				if (auxAlignOK) {
+					KernelPatcher::RouteRequest aux[] {{auxState,wrapTGLSurfaceAux,orgTGLSurfaceAux}};
+					auxAlignOK=patcher.routeMultiple(index,aux,arrsize(aux),address,size);
+				}
+				patcher.clearError();
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
+			if (!iosCCSOK) if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
+			}
 			// r119: retain native RCS flush -> stamp order and all runtime address/
 			// notification fields. Gen12 flushes HDC before completion; Linux v6.12
 			// gen12_emit_fini_breadcrumb_rcs also requires DepthStall (1409600907).
@@ -15618,9 +15622,24 @@ bool XE::configureAlderLakeNWithGT(IOService *that, IOPCIDevice *provider, IOMem
 	return result;
 }
 
+ static void tglRenderWakeFlush(void *expectedOwner,bool keepPaused);
+static void tglRenderWakeResume();
+static IOSimpleLock *tglRenderWakeLock {};
+static thread_call_t tglRenderWakeCall {};
+static uint64_t tglRenderWakeIntervalTicks {};
+struct TGLRenderWakeState {
+ void *owner {};
+ uint64_t lastTouch {};
+ uint32_t activeSubmits {};
+ bool held {};
+ bool armed {};
+ bool paused {};
+ uint64_t acquires {}, hits {}, releases {}, extensions {}, flushes {};
+} tglRenderWake {};
 void XE::wrapTGLAcceleratorStop(IOService *that,IOService *provider) {
  // Stop collecting before native teardown; the serializer only copies storage.
  // Never clear/reuse records while a pending hook can still finish its pair.
+ tglRenderWakeFlush(that,true);
  if (tglHost.owner==that) tglHost.owner=nullptr;
  if (__atomic_load_n(&callbackXE->tglAcceleratorOwner,__ATOMIC_ACQUIRE)==that)
   __atomic_store_n(&callbackXE->tglAcceleratorOwner,static_cast<void *>(nullptr),__ATOMIC_RELEASE);
@@ -15911,6 +15930,7 @@ void XE::wrapTGLHostIRQClassEnable(void *bridge) {
  }
  FunctionCast(wrapTGLHostIRQClassEnable,callbackXE->orgTGLHostIRQClassEnable)(bridge);
  xelpIRQStart(bridge);
+ tglRenderWakeResume();
  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQReady",xelpIRQInstalled);
  tglFBIRQEnd(r,0);
 }
@@ -15918,6 +15938,7 @@ void XE::wrapTGLHostIRQClassDisable(void *bridge) {
  auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
  auto r=owner && owner==tglHost.owner ? tglFBIRQBegin(6,callbackXE->tglObservationController,
   reinterpret_cast<uintptr_t>(bridge),reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
+ tglRenderWakeFlush(owner,true);
  xelpIRQStop(bridge);
  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQReady",false);
  FunctionCast(wrapTGLHostIRQClassDisable,callbackXE->orgTGLHostIRQClassDisable)(bridge);
@@ -16109,6 +16130,77 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+static void tglRenderWakeTimerCallback(thread_call_param_t,thread_call_param_t) {
+ uint64_t now;clock_get_uptime(&now);
+ const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+ if (!tglRenderWake.held || !tglRenderWake.owner) {
+  tglRenderWake.armed=false;
+  IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+  return;
+ }
+ const uint64_t deadline=tglRenderWake.lastTouch+tglRenderWakeIntervalTicks;
+ if (!tglRenderWake.paused && (tglRenderWake.activeSubmits>0 || now<deadline)) {
+  const uint64_t next=(now<deadline)?deadline:(now+tglRenderWakeIntervalTicks);
+  ++tglRenderWake.extensions;tglRenderWake.armed=true;
+  IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+  thread_call_enter_delayed(tglRenderWakeCall,next);
+  return;
+ }
+ void *releaseOwner=tglRenderWake.owner;
+ tglRenderWake.held=false;tglRenderWake.owner=nullptr;tglRenderWake.armed=false;
+ ++tglRenderWake.releases;
+ IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+ tglCSBForceWake[0](releaseOwner,false,1);
+}
+static bool tglRenderWakeSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[8] {1};
+ if (tglRenderWakeLock) {
+  const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+  q[1]=tglRenderWake.acquires;q[2]=tglRenderWake.hits;q[3]=tglRenderWake.releases;
+  q[4]=tglRenderWake.extensions;q[5]=tglRenderWake.flushes;q[6]=20;q[7]=tglRenderWake.held?1:0;
+  IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static void tglRenderWakePrepare() {
+ if (!tglRenderWakeLock) {
+  auto lock=IOSimpleLockAlloc();
+  if (!lock) return;
+  auto call=thread_call_allocate_with_options(tglRenderWakeTimerCallback,nullptr,
+   THREAD_CALL_PRIORITY_KERNEL,THREAD_CALL_OPTIONS_ONCE);
+  if (!call) {IOSimpleLockFree(lock);return;}
+  nanoseconds_to_absolutetime(20000000ULL,&tglRenderWakeIntervalTicks);
+  tglRenderWakeCall=call;tglRenderWakeLock=lock;
+  if (auto live=OSSerializer::forTarget(nullptr,tglRenderWakeSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXRenderWakeHysteresis",live);live->release();
+  }
+ }
+}
+static void tglRenderWakeFlush(void *expectedOwner,bool keepPaused) {
+ if (!tglRenderWakeLock || !tglRenderWakeCall) return;
+ void *releaseOwner=nullptr;
+ const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+ if (keepPaused) tglRenderWake.paused=true;
+ if (tglRenderWake.held && tglRenderWake.owner && (!expectedOwner || tglRenderWake.owner==expectedOwner)) {
+  releaseOwner=tglRenderWake.owner;
+  tglRenderWake.held=false;tglRenderWake.owner=nullptr;
+  ++tglRenderWake.flushes;
+ }
+ IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+ thread_call_cancel_wait(tglRenderWakeCall);
+ const auto post=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+ tglRenderWake.armed=false;
+ IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,post);
+ if (releaseOwner) tglCSBForceWake[0](releaseOwner,false,1);
+}
+static void tglRenderWakeResume() {
+ if (!tglRenderWakeLock) return;
+ const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+ tglRenderWake.paused=false;
+ IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+}
+
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
@@ -16190,7 +16282,8 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
- tglCSB12Enabled=ok;patcher.clearError();return ok;
+ tglCSB12Enabled=ok;if (ok) tglRenderWakePrepare();
+ patcher.clearError();return ok;
 }
 
 bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,unsigned engine) {
@@ -16936,13 +17029,26 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
  auto x=static_cast<uint8_t *>(streamer); uint32_t n=arrsize(tglHost.submit);
  if (tglHost.owner && *reinterpret_cast<void **>(x+0x10)==tglHost.owner)
   n=__sync_fetch_and_add(&tglHost.submits,1);
+ const bool useHysteresis=renderWakeOwner && tglRenderWakeLock && tglRenderWakeCall &&
+  __atomic_load_n(&tglHost.startupDone,__ATOMIC_ACQUIRE) && renderWakeOwner==tglHost.owner &&
+  !checkKernelArgument("-wex-tgl-hold-render-wake");
+ bool renderWakeBorrowed=false;
  if (renderWakeOwner) {
   if (n<arrsize(tglHost.submit)) {
    auto q=tglHost.submit[n].q;q[47]=97;
    q[48]=*reinterpret_cast<volatile uint32_t *>(renderWakeOwner+0x1290);
    q[49]=q[50]=q[114]=UINT64_MAX;
   }
-  tglCSBForceWake[0](renderWakeOwner,true,1);
+  if (useHysteresis) {
+   uint64_t now;clock_get_uptime(&now);
+   const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+   if (!tglRenderWake.paused && tglRenderWake.held && tglRenderWake.owner==renderWakeOwner) {
+    tglRenderWake.lastTouch=now;++tglRenderWake.activeSubmits;++tglRenderWake.hits;
+    renderWakeBorrowed=true;
+   }
+   IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+  }
+  if (!renderWakeBorrowed) tglCSBForceWake[0](renderWakeOwner,true,1);
   if(tglGSYNCObserveReady && renderWakeOwner==tglHost.owner && streamer==tglCSBEngines[0].streamer) {
    if(auto base=tglHostBase()) {
     const auto ack=*reinterpret_cast<volatile uint32_t *>(base+0xD84);
@@ -16979,7 +17085,7 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
       tglVMRead(sp+0x30+(1-bank)*16,item) && item)tglVMRead(item,context);
    tglRPCSPowerObserve(renderWakeOwner,context,n,0);
   }
-  if (cpsOrdinal<=8 || !(cpsOrdinal&255)) if (auto b=tglHostBase()) {
+  if (cpsOrdinal<=8) if (auto b=tglHostBase()) {
    const auto mcrBefore=*reinterpret_cast<volatile uint32_t *>(b+0xFDC);
    const auto row=*reinterpret_cast<volatile uint32_t *>(b+0xE4F4);
    const auto mcrAfter=*reinterpret_cast<volatile uint32_t *>(b+0xFDC);
@@ -17083,7 +17189,26 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
   const bool keep=checkKernelArgument("-wex-tgl-hold-render-wake") &&
    __atomic_exchange_n(&retained,1U,__ATOMIC_RELAXED)==0;
   if (keep) IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderWakeLifetimeTrial",309,32);
-  else tglCSBForceWake[0](renderWakeOwner,false,1);
+  else if (renderWakeBorrowed) {
+   uint64_t now;clock_get_uptime(&now);
+   const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+   if (tglRenderWake.activeSubmits>0) --tglRenderWake.activeSubmits;
+   tglRenderWake.lastTouch=now;
+   IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+  } else if (useHysteresis) {
+   uint64_t now;clock_get_uptime(&now);
+   bool releaseNow=true,needArm=false;
+   const auto prior=IOSimpleLockLockDisableInterrupt(tglRenderWakeLock);
+   if (!tglRenderWake.paused && !tglRenderWake.held && tglHost.owner==renderWakeOwner) {
+    tglRenderWake.owner=renderWakeOwner;tglRenderWake.held=true;
+    tglRenderWake.lastTouch=now;++tglRenderWake.acquires;
+    releaseNow=false;
+    if (!tglRenderWake.armed) {tglRenderWake.armed=true;needArm=true;}
+   }
+   IOSimpleLockUnlockEnableInterrupt(tglRenderWakeLock,prior);
+   if (needArm) thread_call_enter_delayed(tglRenderWakeCall,now+tglRenderWakeIntervalTicks);
+   if (releaseNow) tglCSBForceWake[0](renderWakeOwner,false,1);
+  } else tglCSBForceWake[0](renderWakeOwner,false,1);
   if (n<arrsize(tglHost.submit)) tglHost.submit[n].q[114]=*reinterpret_cast<volatile uint32_t *>(renderWakeOwner+0x1290);
  }
  if (n<arrsize(tglHost.submit)) __atomic_store_n(&tglHost.submit[n].ready,2,__ATOMIC_RELEASE);
