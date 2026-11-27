@@ -490,7 +490,10 @@ bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
 // r137 one-time MMIO write, this follows the context that will render.
 uintptr_t tglCPSAllocate {},tglCPSCPUAddress {},tglCPSGPUAddress {};
 uintptr_t tglCPSRestoreOriginal {},tglCPSRestoreCaller {};
-static bool tglContextCacheEnabled;
+static bool tglContextCacheEnabled,tglContextAuxInvalidate;
+// Linux's render-engine workarounds for Xe-LP that the per-context batch (tglCPSPrepare) rewrites on every context
+// restore: the thread-dispatch ones on every family, the semaphore idle message where Linux applies it.
+static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute,tglContextHiZSampler;
 static uintptr_t tglContextCacheInitOriginal;
 static bool tglAlderLakeNGoldenRestore(void *context);
 static void adlnCaptureOwnedGolden(void *context);
@@ -530,9 +533,36 @@ static bool tglCPSPrepare(void *owner) {
  // complete TGL timer value after every context restore; no read/modify/write.
  // r160: Wa_1606931601, masked EU early-read disable. Existing multicast
  // steering is retained; this adds no CPU MMIO write or synchronization wait.
- const uint32_t batch[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
- bzero(cpu,extent);memcpy(cpu,batch,sizeof(batch));
- if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
+ // Four more of Linux's Xe-LP workarounds (i915 rcs_engine_wa_init and gen12_ctx_workarounds_init, xe engine_was
+ // and lrc_was) go in the same load, so that every context restore rewrites them, after a reset too:
+ //   Wa_1409804808, ROW_CHICKEN2 bit 8: no hold on the dereference of push constants;
+ //   Wa_14010229206, ROW_CHICKEN4 bit 9: no push from the thread dispatcher;
+ //   Wa_1606376872, COMMON_SLICE_CHICKEN4 bit 6: no load-balancing calculation in the thread dispatch control;
+ //   Wa_1607297627, RING_PSMI_CTL bits 7 and 12: no power-down while the engine waits for an event, and no idle
+ //   message to the power unit while it waits on a semaphore. The donor's scheduler makes the render engine wait
+ //   on semaphores for other channels' stamps all the time. With the donor's second render ring in use, the
+ //   same bits go to its RING_PSMI_CTL at 0x1A050.
+ // Two more that Linux sets on every Xe-LP render context (i915 gen12_ctx_workarounds_init and
+ // rcs_engine_wa_init, xe lrc_was and engine_was), unless -wex-no-ctx-hiz-wa:
+ //   Wa_1806527549, HIZ_CHICKEN bit 13: no HiZ depth-test optimisation for the LE and GE functions. The donor
+ //   never writes the register;
+ //   Wa_1406941453, SAMPLER_MODE bit 15 (ENABLE_SMALLPL). The donor sets it by MMIO when the engine starts, behind
+ //   bit 17 of its workaround mask; the register travels with the render context, so an image saved before that
+ //   write would bring it back clear. In the load it is in every context, after every restore.
+ // TGLContextWorkaroundsLive reads both back from the resident context.
+ uint32_t batch[24] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000};
+ unsigned words=8;
+ if(tglEngineWorkarounds) {
+  batch[7]=0x41004100;batch[words++]=0xE48C;batch[words++]=0x02000200;
+  batch[words++]=0x7300;batch[words++]=0x00400040;
+  if(tglContextHiZSampler) {batch[words++]=0x7018;batch[words++]=0x20002000;batch[words++]=0xE18C;batch[words++]=0x80008000;}
+  if(tglEngineSemaphoreIdle) {batch[words++]=0x2050;batch[words++]=0x10801080;}
+  if(tglEngineSemaphoreIdleCompute) {batch[words++]=0x1A050;batch[words++]=0x10801080;}
+  batch[1]=0x11000000|(words-3); // MI_LOAD_REGISTER_IMM length: two dwords per register, minus one
+ }
+ batch[words++]=0x05000000;
+ bzero(cpu,extent);memcpy(cpu,batch,words*sizeof(uint32_t));
+ if(tglContextCacheEnabled)TGLContextCache::batch(cpu,tglContextAuxInvalidate);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");
  asm volatile("mfence":::"memory");
@@ -579,6 +609,13 @@ bool tglCPSSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// Schema 1: soft mode, installed, soft declines, closed refusals.
+static bool tglContextCacheSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[5] {1,TGLContextCache::soft()};
+ for(unsigned i=0;i<3;++i)out[i+2]=__atomic_load_n(&TGLContextCache::counts()[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 // Constructor return is before scheduler submission. This covers fresh RCS
 // images and safe-image clones; beginReset later restores the qualified image.
 // Do not change POCS/CCS, native completion, or an already submitted context.
@@ -588,11 +625,12 @@ static bool tglContextCacheInit(void *context,void *task,const void *params,uint
  auto c=static_cast<uint8_t *>(context);if(c[0x6C]!=0)return true;
  auto owner=*reinterpret_cast<uint8_t **>(c+0x50);
  auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
- if(!owner || !buffer || !*reinterpret_cast<void **>(owner+0x13F8))return false;
+ if(!owner || !buffer || !*reinterpret_cast<void **>(owner+0x13F8))return TGLContextCache::decline(ok);
  auto cpu=reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer);
  const auto size=*reinterpret_cast<uint64_t *>(buffer+0x20);
  const auto gpu=__atomic_load_n(&tglCPSCounts[2],__ATOMIC_RELAXED);
- if(!TGLContextCache::install(cpu,size,gpu))return false;
+ if(!TGLContextCache::install(cpu,size,gpu))return TGLContextCache::decline(ok);
+ __atomic_fetch_add(&TGLContextCache::counts()[0],1U,__ATOMIC_RELAXED);
  asm volatile("clflush (%0)"::"r"(static_cast<uint8_t *>(cpu)+0x1054):"memory");
  asm volatile("mfence":::"memory");return true;
 }
@@ -600,6 +638,16 @@ static bool tglContextCacheInit(void *context,void *task,const void *params,uint
 // Read-only sparse samples during the existing RCS forcewake. These are resident
 // register values, not the incoming draw's identity. No GPU/register writes.
 uint32_t tglStateRedirectCounts[4] {}; // samples, bit11 set, invalid all-ones, last
+// Resident-context receipts of the per-context workarounds, read where TGLCPSColorPipeLive reads 0x7304: samples with
+// this plugin's batch pointer, of those with HIZ_CHICKEN bit 13, with SAMPLER_MODE bit 15, with COMMON_SLICE_CHICKEN4
+// bit 6, then the last 0x7018, 0xE18C and 0x7300.
+uint32_t tglContextWaCounts[7] {};
+static bool tglContextWaSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[9] {1,uint32_t(tglContextHiZSampler)};
+ for(unsigned i=0;i<7;++i)out[i+2]=__atomic_load_n(&tglContextWaCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 bool tglStateRedirectSerialize(void *,void *,OSSerialize *serializer) {
  uint32_t out[5] {150};
  for(unsigned i=0;i<4;++i)out[i+1]=__atomic_load_n(&tglStateRedirectCounts[i],__ATOMIC_RELAXED);
@@ -12271,11 +12319,87 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.applyLookupPatch(&patch,ffModeSite,sizeof(ffModeFind)+1);
 				ffModeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffModeSite,ffModeReplace,sizeof(ffModeReplace));
 			}
+			// Metal compute runs on the render engine, which the window server's drawing keeps preempting. For a GPGPU
+			// walker the donor asks for preemption between thread groups (0x60002, or mid-thread with a flags bit that is
+			// never set) and writes that level to 0x20E4, the global granularity that applies while r144 leaves
+			// per-context control off, and to 0x2580. Outside Tiger Lake a walker resumed that way can leave the command
+			// streamer stopped on it or on the PIPE_CONTROL after it, with the EUs idle: compute work in command buffers of
+			// up to a second hung the GPU within minutes while the screen was being composed, and never with the displays
+			// asleep. Preempt compute only between commands (0x60004, the level Intel's media driver programs under
+			// WaMidBatchPreemption): the window server gets the engine at the next walker boundary and no walker is
+			// resumed halfway. -wex-native-gpgpu-preempt keeps the donor's level.
+			const bool commandPreempt=xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+				!checkKernelArgument("-wex-native-gpgpu-preempt");
+			const uint8_t gpgpuLevelFind[] {0x83,0xE1,0x02,0x81,0xF1,0x02,0x00,0x06,0x00};
+			const uint8_t gpgpuLevelReplace[] {0xB9,0x04,0x00,0x06,0x00,0x0F,0x1F,0x40,0x00};
+			auto gpgpuLevelSite=reinterpret_cast<uint8_t *>(address+0x2515D);
+			bool gpgpuLevelOK=commandPreempt && objectPreemptOK && !memcmp(gpgpuLevelSite,gpgpuLevelFind,sizeof(gpgpuLevelFind));
+			patcher.clearError();
+			if(gpgpuLevelOK) {
+				KernelPatcher::LookupPatch patch {currentGraphics,gpgpuLevelFind,gpgpuLevelReplace,sizeof(gpgpuLevelFind),1};
+				patcher.applyLookupPatch(&patch,gpgpuLevelSite,sizeof(gpgpuLevelFind)+1);
+				gpgpuLevelOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(gpgpuLevelSite,gpgpuLevelReplace,sizeof(gpgpuLevelReplace));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUCommandPreemptionReady",gpgpuLevelOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFModeTimerReady",ffModeOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFDOPClockDisableReady",ffDopOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionGlobalReady",selectorOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
 			patcher.clearError();
+			// The donor picks its hardware workaround mask by PCI revision (InitTglLpHwWaTable): revisions 0 to 3,
+			// which in Linux's stepping tables is every Tiger Lake, get thirteen more workarounds than later ones.
+			// Raptor Lake-P is revision 4 and Alder Lake-P goes up to 0x0C, so there the donor leaves out
+			// workarounds that Linux applies on that silicon whatever the stepping. Add their bits to the
+			// later-revision mask, so that the donor's own engine start programs them: 23 FF_THREAD_MODE bit 19
+			// (Wa_14010919138), 38 COMMON_SLICE_CHICKEN4 bit 6 (Wa_1606376872), 47 ROW_CHICKEN4 bit 9
+			// (Wa_14010229206) and, where Linux applies Wa_1607297627, 43 RING_PSMI_CTL bits 7 and 12, with 44 for
+			// the second render ring when -wex-parallel-compute keeps it in use. The rest stay off: Linux has none
+			// of the writes they gate in its list for Alder or Raptor Lake. -wex-no-engine-wa leaves the mask alone.
+			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-no-engine-wa")) {
+				uint64_t mask=0x1F8C5FEC00ULL|1ULL<<23|1ULL<<38|1ULL<<47;
+				if(xeProfile.family!=XELP::Family::AlderLakeS && xeProfile.family!=XELP::Family::RaptorLakeS)
+					mask|=1ULL<<43|(checkKernelArgument("-wex-parallel-compute")?1ULL<<44:0);
+				// movabs $0x1F8C5FEC00,%rcx; cmovb %r11,%rcx
+				const uint8_t maskFind[] {0x48,0xB9,0x00,0xEC,0x5F,0x8C,0x1F,0x00,0x00,0x00,0x49,0x0F,0x42,0xCB};
+				uint8_t maskReplace[sizeof(maskFind)];
+				memcpy(maskReplace,maskFind,sizeof(maskFind));memcpy(maskReplace+2,&mask,sizeof(mask));
+				auto maskSite=reinterpret_cast<uint8_t *>(address+0x7B720);
+				bool maskOK=size>0x7B72E &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__Z18InitTglLpHwWaTableP9_WA_TABLEP18_SKU_FEATURE_TABLEjtt",address,size)==address+0x7B6B6 &&
+					!memcmp(maskSite,maskFind,sizeof(maskFind));
+				patcher.clearError();
+				if(maskOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,maskFind,maskReplace,sizeof(maskFind),1};
+					patcher.applyLookupPatch(&patch,maskSite,sizeof(maskFind)+1);
+					maskOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(maskSite,maskReplace,sizeof(maskReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLWorkaroundMaskReady",maskOK);
+			}
+			// Compute on the render engine (wrapTGLAcceleratorStart clears EnableMultiContext outside Tiger Lake):
+			// IntelTGLMemoryManager::newUnifiedAddressRangeAllocator reserves the upper canonical half of each
+			// task's address allocator only with multi-context on. Drop that test (`je` after the accelerator-flag
+			// test, two NOPs) so the reservation stays and the address layout is the one this donor has always
+			// run with; with multi-context on the patched code does what the native one does. Same site as
+			// -wex-tgl-nomc in SaqibAlMalik's tgl-stability branch, a port of NootedGreen's -ngreennomc.
+			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-parallel-compute")) {
+				const uint8_t rangeFind[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x74,0x26,0x41,0xF6,0x46,0x24,0x02};
+				const uint8_t rangeReplace[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x90,0x90,0x41,0xF6,0x46,0x24,0x02};
+				auto rangeSite=reinterpret_cast<uint8_t *>(address+0x4BF0A);
+				bool rangeOK=size>0x4BF18 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21IntelTGLMemoryManager31newUnifiedAddressRangeAllocatorEP11IGAccelTask",address,size)==address+0x4BED8 &&
+					!memcmp(rangeSite,rangeFind,sizeof(rangeFind));
+				patcher.clearError();
+				if(rangeOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,rangeFind,rangeReplace,sizeof(rangeFind),1};
+					patcher.applyLookupPatch(&patch,rangeSite,sizeof(rangeFind)+1);
+					rangeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(rangeSite,rangeReplace,sizeof(rangeReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeRangeReady",rangeOK);
+			}
 			// r116: GT2 with 80 EU has ten enabled subslices, but the donor
 			// recognizes only twelve and leaves hwInfo+0x54 (URB banks) zero.
 			// The MTL allocator then underflows after reserving push constants.
@@ -12836,7 +12960,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const bool tahoeTrialScope=!adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
 				(XELP::kernelOS(version)==XELP::OS::Tahoe);
 			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
-			const bool contextCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&2);
+			// Linux applies Wa_18022495364 to TGL, ADL and RPL (Xe_LP 12.00-12.10).
+			// The ADL-N backend also drives ADL-P/RPL-P; on by default on the same
+			// Tahoe host-scheduler target, -wex-no-adln-ctx-invalidate turns it off.
+			// That scope only enables the indirect trial and declines an unqualified
+			// image per context instead of failing construction.
+			const bool adlnContextCacheRequested=adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
+				(XELP::kernelOS(version)==XELP::OS::Tahoe) && !checkKernelArgument("-wex-no-adln-ctx-invalidate");
+			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
+			TGLContextCache::soft()=adlnContextCacheRequested;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.
@@ -12926,7 +13058,29 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.clearError();
 			}
 			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
+			// Render compression goes through a per-task aux table, and the donor asks the engine to drop its
+			// cached entries only after it has changed a mapping. Linux also asks on every context restore, in the
+			// batch this plugin already installs for Wa_18022495364. -wex-no-aux-inv leaves that out.
+			tglContextAuxInvalidate=tglContextCacheEnabled && !checkKernelArgument("-wex-no-aux-inv");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextAuxInvalidateSelected",tglContextAuxInvalidate);
+			// Linux programs Wa_1409804808 and Wa_14010229206 on every integrated Xe-LP, and Wa_1607297627 on
+			// Tiger Lake, Rocket Lake and Alder Lake-P, which there covers Alder Lake-N and Raptor Lake-P. The donor
+			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
+			// -wex-no-engine-wa keeps the donor's values.
+			tglEngineWorkarounds=cpsOK && xeProfile.family!=XELP::Family::Unknown && !checkKernelArgument("-wex-no-engine-wa");
+			tglContextHiZSampler=tglEngineWorkarounds && !checkKernelArgument("-wex-no-ctx-hiz-wa");
+			tglEngineSemaphoreIdle=tglEngineWorkarounds && xeProfile.family!=XELP::Family::AlderLakeS &&
+				xeProfile.family!=XELP::Family::RaptorLakeS;
+			// The second render ring is in use outside Tiger Lake only with -wex-parallel-compute; on Tiger Lake
+			// its register stays with the donor's own workaround mask.
+			tglEngineSemaphoreIdleCompute=tglEngineSemaphoreIdle && xeProfile.family!=XELP::Family::TigerLake &&
+				checkKernelArgument("-wex-parallel-compute");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLEngineWorkaroundsSelected",
+				uint32_t(tglEngineWorkarounds)|uint32_t(tglEngineSemaphoreIdle)<<1|uint32_t(tglEngineSemaphoreIdleCompute)<<2,32);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheIndirectReady",tglContextCacheEnabled);
+			if(tglContextCacheEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglContextCacheSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheLive",live);live->release();
+			}
 			// The native RCS constructor initializes RPCS with ENABLE alone.
 			// Request the one TGL slice explicitly, as intel_sseu_make_rpcs does.
 			// Preserve the instruction and native ownership/lifetime of the image.
@@ -12971,6 +13125,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			if(auto live=OSSerializer::forTarget(nullptr,tglCPSSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeLive",live);live->release();
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglContextWaSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextWorkaroundsLive",live);live->release();
 			}
 			if(auto live=OSSerializer::forTarget(nullptr,tglEarlyReadSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLEarlyReadLive",live);live->release();
@@ -15454,6 +15611,25 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (!that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
+	// The donor's personalities set EnableMultiContext=1 in the Development dictionary: Metal compute then gets
+	// its hardware contexts on a second render-class engine, the compute command streamer at 0x1A000, which shares
+	// the execution units and the reset domain with the render engine. Linux exposes no such engine on Xe-LP,
+	// Tiger Lake to Raptor Lake (i915 and xe: render, blitter and video engines only). On Raptor Lake-P the
+	// render engine sometimes stalled inside a context restore, between the ring context and the engine state,
+	// each time with compute work in flight on the second engine (a long kernel, a background Core ML inference,
+	// a video filter), and the window server froze until the hang check reset the GPU. Outside Tiger Lake, clear
+	// the key before the donor reads it (populateAccelConfig): its own code then creates compute contexts on the
+	// render engine and leaves the second engine disabled in RCU_MODE. -wex-parallel-compute keeps the
+	// personality's value.
+	if (callbackXE->xeProfile.family!=XELP::Family::Unknown && callbackXE->xeProfile.family!=XELP::Family::TigerLake &&
+	    !checkKernelArgument("-wex-parallel-compute")) {
+		auto development=OSDynamicCast(OSDictionary,that->getProperty("Development"));
+		auto copy=development ? OSDictionary::withDictionary(development) : nullptr;
+		auto off=OSNumber::withNumber(0ULL,32);
+		const bool serial=copy && off && copy->setObject("EnableMultiContext",off) && that->setProperty("Development",copy);
+		OSSafeReleaseNULL(off);OSSafeReleaseNULL(copy);
+		IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeSelected",serial);
+	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
@@ -17233,6 +17409,17 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    __atomic_fetch_add(&tglCPSCounts[ptr==expected?10:11],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[(v&0x200)?6:7],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[5],1,__ATOMIC_RELAXED);
+   if(ptr==expected) {
+    const uint32_t hiz=*reinterpret_cast<volatile uint32_t *>(b+0x7018),sampler=*reinterpret_cast<volatile uint32_t *>(b+0xE18C),
+     slice=*reinterpret_cast<volatile uint32_t *>(b+0x7300);
+    __atomic_fetch_add(&tglContextWaCounts[0],1,__ATOMIC_RELAXED);
+    if(hiz!=UINT32_MAX && (hiz&0x2000))__atomic_fetch_add(&tglContextWaCounts[1],1,__ATOMIC_RELAXED);
+    if(sampler!=UINT32_MAX && (sampler&0x8000))__atomic_fetch_add(&tglContextWaCounts[2],1,__ATOMIC_RELAXED);
+    if(slice!=UINT32_MAX && (slice&0x40))__atomic_fetch_add(&tglContextWaCounts[3],1,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[4],hiz,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[5],sampler,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[6],slice,__ATOMIC_RELAXED);
+   }
   }
   // Read only while the existing RCS submit wrapper owns forcewake.
   // These are resident hardware values, not the incoming context's state.
@@ -17243,6 +17430,8 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    q[54]=*reinterpret_cast<volatile uint32_t *>(b+0x2580);
    q[55]=*reinterpret_cast<volatile uint32_t *>(b+0x20A0);
    q[56]=*reinterpret_cast<volatile uint32_t *>(b+0x7304);
+   // The global GPGPU preemption granularity.
+   q[57]=*reinterpret_cast<volatile uint32_t *>(b+0x20E4);
   }
  }
  if (n<arrsize(tglHost.submit)) {

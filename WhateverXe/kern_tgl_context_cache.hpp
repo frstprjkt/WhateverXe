@@ -1,4 +1,5 @@
-// Gen12 Wa_18022495364: invalidate instruction/state cache during RCS restore.
+// Gen12 Wa_18022495364: invalidate instruction/state cache during RCS restore,
+// with the aux table invalidation Linux requests in the same batch.
 // Linux v6.12 intel_lrc.c uses a cacheline-sized INDIRECT_CTX at offset 0xD.
 #ifndef kern_tgl_context_cache_hpp
 #define kern_tgl_context_cache_hpp
@@ -7,8 +8,14 @@
 #include <string.h>
 namespace TGLContextCache {
 constexpr unsigned BatchOffset=4096, BatchBytes=64, RestoreOffset=0xD<<6;
-inline void batch(void *page) {
- uint32_t words[16] {0x11000001,0x20D8,0x00400040};
+inline void batch(void *page,bool auxInvalidate=false) {
+ // The order of Linux's gen12_emit_indirect_ctx_rcs. First the aux table invalidation it requests on every render
+ // restore on Gen12 without flat CCS: GEN12_CCS_AUX_INV (0x4208) bit 0. The donor writes that register from its
+ // rings, but only after it has changed its own aux mappings, never because another context's table was loaded.
+ // Linux then polls the register until the bit clears; this batch does not wait. Then Wa_18022495364.
+ uint32_t words[16] {};unsigned n=0;
+ if(auxInvalidate) {words[n++]=0x11000001;words[n++]=0x4208;words[n++]=0x00000001;}
+ words[n++]=0x11000001;words[n++]=0x20D8;words[n++]=0x00400040;
  // INDIRECT_CTX is length-delimited, with NOOP padding, not MI_BATCH_BUFFER_END.
  memcpy(static_cast<uint8_t *>(page)+BatchOffset,words,sizeof(words));
 }
@@ -19,6 +26,16 @@ inline bool install(void *image,size_t size,uint64_t gpu) {
  if(w[0]!=0x21C0 || w[1]!=(gpu|5) || w[2]!=0x21C4 || w[4]!=0x21C8 ||
     (w[3] && w[3]!=pointer) || (w[5] && w[5]!=RestoreOffset))return false;
  memcpy(p+0x1054,&pointer,4);memcpy(p+0x105C,&RestoreOffset,4);return true;
+}
+// Counts: installed, soft declines, closed refusals. Function-local statics
+// keep this header usable from C++14 fixtures without inline variables.
+inline uint32_t *counts() {static uint32_t c[3] {};return c;}
+// Soft mode: an unqualified image keeps its native INDIRECT_CTX (none) and the
+// context is created normally; closed mode (TGL trial) fails construction.
+inline bool &soft() {static bool s=false;return s;}
+inline bool decline(bool constructed) {
+ if(soft()) {__atomic_fetch_add(&counts()[1],1U,__ATOMIC_RELAXED);return constructed;}
+ __atomic_fetch_add(&counts()[2],1U,__ATOMIC_RELAXED);return false;
 }
 }
 #endif

@@ -153,5 +153,11 @@
   "-wex-no-nv-webkit": [],
   "-wex-nv-video": [],
   "-wex-g15-gtgov-off": [],
-  "-wex-tgl-no-hangwake": []
+  "-wex-tgl-no-hangwake": [],
+  "-wex-no-adln-ctx-invalidate": [],
+  "-wex-no-aux-inv": [],
+  "-wex-parallel-compute": [],
+  "-wex-no-engine-wa": [],
+  "-wex-no-ctx-hiz-wa": [],
+  "-wex-native-gpgpu-preempt": []
 }
