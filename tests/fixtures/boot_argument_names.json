@@ -152,5 +152,6 @@
   "-wex-dsi-power-test": [],
   "-wex-no-nv-webkit": [],
   "-wex-nv-video": [],
-  "-wex-g15-gtgov-off": []
+  "-wex-g15-gtgov-off": [],
+  "-wex-tgl-no-hangwake": []
 }
