@@ -206,7 +206,7 @@ void XE::setHostSurfaceABI(unsigned framebuffer,unsigned accelerator) {
  tglHostSurfaceABI[1]=static_cast<XELPNative::SurfaceABI>(accelerator);
 }
 static bool tglSonomaSurfaceFramebufferReady=false;
-static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
+__attribute__((noinline)) static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
  const auto layout=tglHostSurfaceABI[framebuffer?0:1];
  if(layout==XELPNative::SurfaceABI::Unknown)return false;
  if(layout==XELPNative::SurfaceABI::Original)return true;
@@ -11927,7 +11927,7 @@ bool tglHangWakeSerialize(void *,void *,OSSerialize *serializer) {
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 }
-static void tglInstallHangWakeBalance(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+__attribute__((noinline)) static void tglInstallHangWakeBalance(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  auto root=IORegistryEntry::getRegistryRoot();
  if (checkKernelArgument("-wex-tgl-no-hangwake")) { root->setProperty("TGLHangWakeBalanceReady",false);return; }
  const char *symbol="__ZN16IntelAccelerator17gatherKeyRingDataE10IGHwCsType";
@@ -12169,6 +12169,828 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 }
 }
 
+static __attribute__((noinline)) bool tglPatchEnginePreemptionAndWA(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    KernelPatcher::KextInfo *kext, bool skuReady, XELP::Family family) {
+			// r135: TGL B0 object-preemption topology corruption (Vol14 UP3 p53).
+			// One native immediate feeds both CS_DEBUG_MODE1 and CS_CHICKEN1.
+			// Keep its write mask and compute-preemption fields; clear only bit0.
+			static const uint8_t objectPreemptFind[] {0xBA,0x01,0x00,0x01,0x00,0x89,0x90,0xEC,0x20,0x00,0x00};
+			static const uint8_t objectPreemptReplace[] {0xBA,0x00,0x00,0x01,0x00,0x89,0x90,0xEC,0x20,0x00,0x00};
+			auto objectPreemptSite=reinterpret_cast<uint8_t *>(address+0x2516C);
+			bool objectPreemptOK=skuReady && size>0x251A1 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator19startGraphicsEngineEv",address,size)==address+0x25100 &&
+				!memcmp(objectPreemptSite,objectPreemptFind,sizeof(objectPreemptFind));
+			patcher.clearError();
+			if (objectPreemptOK) {
+				KernelPatcher::LookupPatch patch {kext,objectPreemptFind,objectPreemptReplace,sizeof(objectPreemptFind),1};
+				patcher.applyLookupPatch(&patch,objectPreemptSite,sizeof(objectPreemptFind)+1);
+				objectPreemptOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(objectPreemptSite,objectPreemptReplace,sizeof(objectPreemptReplace));
+			}
+			// r144: contexts can restore 2580 bit0 to1 (42/97 resident receipts).
+			// Select the global20EC bit0, which r135 clears and all97 receipts retain.
+			// Vol14 UP3 p53: object_preempt_en=20E0[14]?2580[0]:20EC[0].
+			static const uint8_t objectSelectorFind[] {0xC7,0x80,0xE0,0x20,0,0,0,0x40,0,0x40};
+			static const uint8_t objectSelectorReplace[] {0xC7,0x80,0xE0,0x20,0,0,0,0,0,0x40};
+			auto selectorSite=reinterpret_cast<uint8_t *>(address+0x25189);
+			bool selectorOK=objectPreemptOK && !memcmp(selectorSite,objectSelectorFind,sizeof(objectSelectorFind));
+			patcher.clearError();
+			if(selectorOK) {
+				KernelPatcher::LookupPatch patch {kext,objectSelectorFind,objectSelectorReplace,sizeof(objectSelectorFind),1};
+				patcher.applyLookupPatch(&patch,selectorSite,sizeof(objectSelectorFind)+1);
+				selectorOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(selectorSite,objectSelectorReplace,sizeof(objectSelectorReplace));
+			}
+			// r145: Linux Gen12 engine WA requires FF DOP clock gating disabled.
+			// Write20EC with mask bits1:0 (bit1 on, bit0 off), then restore EDX
+			// to r135's10000 before it also feeds2580. Do not alter compute mode.
+			// The replaced MMIO read was overwritten by the following MOV immediate.
+			static const uint8_t ffDopFind[] {0x8B,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x89,0x90,0xEC,0x20,0,0};
+			static const uint8_t ffDopReplace[] {0xBA,2,0,3,0,0x89,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x90};
+			auto ffDopSite=reinterpret_cast<uint8_t *>(address+0x25166);
+			bool ffDopOK=selectorOK && !memcmp(ffDopSite,ffDopFind,sizeof(ffDopFind));
+			patcher.clearError();
+			if(ffDopOK) {
+				KernelPatcher::LookupPatch patch {kext,ffDopFind,ffDopReplace,sizeof(ffDopFind),1};
+				patcher.applyLookupPatch(&patch,ffDopSite,sizeof(ffDopFind)+1);
+				ffDopOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffDopSite,ffDopReplace,sizeof(ffDopReplace));
+			}
+			// r146: TGL FF_MODE2 must not be CPU read/modify/written. Linux's
+			// Wa1608008084 programs TDS128 | GS224 with all other fields zero.
+			// Replace the conditional RMW as a whole, including its obsolete WA gate.
+			// Context restores receive the same value in the native-owned batch.
+			static const uint8_t ffModeFind[] {0x0F,0xBA,0x63,0x18,0x1A,0x73,0x0A,0x81,0x88,0x04,0x66,0,0,0,0,4,0};
+			static const uint8_t ffModeReplace[] {0xC7,0x80,0x04,0x66,0,0,0,0,4,0xE0,0x90,0x90,0x90,0x90,0x90,0x90,0x90};
+			auto ffModeSite=reinterpret_cast<uint8_t *>(address+0x2561C);
+			bool ffModeOK=ffDopOK && size>0x25637 && !memcmp(ffModeSite,ffModeFind,sizeof(ffModeFind));
+			patcher.clearError();
+			if(ffModeOK) {
+				KernelPatcher::LookupPatch patch {kext,ffModeFind,ffModeReplace,sizeof(ffModeFind),1};
+				patcher.applyLookupPatch(&patch,ffModeSite,sizeof(ffModeFind)+1);
+				ffModeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffModeSite,ffModeReplace,sizeof(ffModeReplace));
+			}
+			// Metal compute runs on the render engine, which the window server's drawing keeps preempting. For a GPGPU
+			// walker the donor asks for preemption between thread groups (0x60002, or mid-thread with a flags bit that is
+			// never set) and writes that level to 0x20E4, the global granularity that applies while r144 leaves
+			// per-context control off, and to 0x2580. Outside Tiger Lake a walker resumed that way can leave the command
+			// streamer stopped on it or on the PIPE_CONTROL after it, with the EUs idle: compute work in command buffers of
+			// up to a second hung the GPU within minutes while the screen was being composed, and never with the displays
+			// asleep. Preempt compute only between commands (0x60004, the level Intel's media driver programs under
+			// WaMidBatchPreemption): the window server gets the engine at the next walker boundary and no walker is
+			// resumed halfway. -wex-native-gpgpu-preempt keeps the donor's level.
+			const bool commandPreempt=family!=XELP::Family::Unknown && family!=XELP::Family::TigerLake &&
+				!checkKernelArgument("-wex-native-gpgpu-preempt");
+			static const uint8_t gpgpuLevelFind[] {0x83,0xE1,0x02,0x81,0xF1,0x02,0x00,0x06,0x00};
+			static const uint8_t gpgpuLevelReplace[] {0xB9,0x04,0x00,0x06,0x00,0x0F,0x1F,0x40,0x00};
+			auto gpgpuLevelSite=reinterpret_cast<uint8_t *>(address+0x2515D);
+			bool gpgpuLevelOK=commandPreempt && objectPreemptOK && !memcmp(gpgpuLevelSite,gpgpuLevelFind,sizeof(gpgpuLevelFind));
+			patcher.clearError();
+			if(gpgpuLevelOK) {
+				KernelPatcher::LookupPatch patch {kext,gpgpuLevelFind,gpgpuLevelReplace,sizeof(gpgpuLevelFind),1};
+				patcher.applyLookupPatch(&patch,gpgpuLevelSite,sizeof(gpgpuLevelFind)+1);
+				gpgpuLevelOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(gpgpuLevelSite,gpgpuLevelReplace,sizeof(gpgpuLevelReplace));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUCommandPreemptionReady",gpgpuLevelOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFModeTimerReady",ffModeOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFDOPClockDisableReady",ffDopOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionGlobalReady",selectorOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
+			patcher.clearError();
+			// The donor picks its hardware workaround mask by PCI revision (InitTglLpHwWaTable): revisions 0 to 3,
+			// which in Linux's stepping tables is every Tiger Lake, get thirteen more workarounds than later ones.
+			// Raptor Lake-P is revision 4 and Alder Lake-P goes up to 0x0C, so there the donor leaves out
+			// workarounds that Linux applies on that silicon whatever the stepping. Add their bits to the
+			// later-revision mask, so that the donor's own engine start programs them: 23 FF_THREAD_MODE bit 19
+			// (Wa_14010919138), 38 COMMON_SLICE_CHICKEN4 bit 6 (Wa_1606376872), 47 ROW_CHICKEN4 bit 9
+			// (Wa_14010229206) and, where Linux applies Wa_1607297627, 43 RING_PSMI_CTL bits 7 and 12, with 44 for
+			// the second render ring when -wex-parallel-compute keeps it in use. The rest stay off: Linux has none
+			// of the writes they gate in its list for Alder or Raptor Lake. -wex-no-engine-wa leaves the mask alone.
+			if(family!=XELP::Family::Unknown && family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-no-engine-wa")) {
+				uint64_t mask=0x1F8C5FEC00ULL|1ULL<<23|1ULL<<38|1ULL<<47;
+				if(family!=XELP::Family::AlderLakeS && family!=XELP::Family::RaptorLakeS)
+					mask|=1ULL<<43|(checkKernelArgument("-wex-parallel-compute")?1ULL<<44:0);
+				// movabs $0x1F8C5FEC00,%rcx; cmovb %r11,%rcx
+				static const uint8_t maskFind[] {0x48,0xB9,0x00,0xEC,0x5F,0x8C,0x1F,0x00,0x00,0x00,0x49,0x0F,0x42,0xCB};
+				uint8_t maskReplace[sizeof(maskFind)];
+				memcpy(maskReplace,maskFind,sizeof(maskFind));memcpy(maskReplace+2,&mask,sizeof(mask));
+				auto maskSite=reinterpret_cast<uint8_t *>(address+0x7B720);
+				bool maskOK=size>0x7B72E &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__Z18InitTglLpHwWaTableP9_WA_TABLEP18_SKU_FEATURE_TABLEjtt",address,size)==address+0x7B6B6 &&
+					!memcmp(maskSite,maskFind,sizeof(maskFind));
+				patcher.clearError();
+				if(maskOK) {
+					KernelPatcher::LookupPatch patch {kext,maskFind,maskReplace,sizeof(maskFind),1};
+					patcher.applyLookupPatch(&patch,maskSite,sizeof(maskFind)+1);
+					maskOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(maskSite,maskReplace,sizeof(maskReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLWorkaroundMaskReady",maskOK);
+			}
+			// Compute on the render engine (wrapTGLAcceleratorStart clears EnableMultiContext outside Tiger Lake):
+			// IntelTGLMemoryManager::newUnifiedAddressRangeAllocator reserves the upper canonical half of each
+			// task's address allocator only with multi-context on. Drop that test (`je` after the accelerator-flag
+			// test, two NOPs) so the reservation stays and the address layout is the one this donor has always
+			// run with; with multi-context on the patched code does what the native one does. Same site as
+			// -wex-tgl-nomc in SaqibAlMalik's tgl-stability branch, a port of NootedGreen's -ngreennomc.
+			if(family!=XELP::Family::Unknown && family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-parallel-compute")) {
+				static const uint8_t rangeFind[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x74,0x26,0x41,0xF6,0x46,0x24,0x02};
+				static const uint8_t rangeReplace[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x90,0x90,0x41,0xF6,0x46,0x24,0x02};
+				auto rangeSite=reinterpret_cast<uint8_t *>(address+0x4BF0A);
+				bool rangeOK=size>0x4BF18 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21IntelTGLMemoryManager31newUnifiedAddressRangeAllocatorEP11IGAccelTask",address,size)==address+0x4BED8 &&
+					!memcmp(rangeSite,rangeFind,sizeof(rangeFind));
+				patcher.clearError();
+				if(rangeOK) {
+					KernelPatcher::LookupPatch patch {kext,rangeFind,rangeReplace,sizeof(rangeFind),1};
+					patcher.applyLookupPatch(&patch,rangeSite,sizeof(rangeFind)+1);
+					rangeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(rangeSite,rangeReplace,sizeof(rangeReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeRangeReady",rangeOK);
+			}
+	return ffModeOK;
+}
+
+static __attribute__((noinline)) void tglPatchVideoCCSHiZAndGGTT(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    KernelPatcher::KextInfo *kext, bool skuReady, bool urbReady,
+    bool mobilePrimaryVCS2, bool adlnDetected,
+    bool &videoRoutingReadyOut, bool &ccsReadyOut, bool &hizReadyOut, bool &ccsPSReadyOut, bool &ggttOKOut) {
+            // getGPUInfo enumerates physical engines from 0x9140. Keep its mask
+            // and descriptors. Select that same engine for the startup context
+            // and for each media client's ring before native FIFO allocation.
+            bool videoRoutingReady = !mobilePrimaryVCS2;
+            if (mobilePrimaryVCS2 && urbReady && size > 0xBE8AC) {
+                static const uint8_t testVCS0[] {0x41,0xF6,0x85,0,0x13,0,0,8};
+                static const uint8_t testVCS2[] {0x41,0xF6,0x85,0,0x13,0,0,16};
+                static const uint8_t context0[] {3,0,8,0,1,0,0,0,0,0,0,0};
+                static const uint8_t context2[] {4,0,8,0,1,0,0,0,2,0,0,0};
+                auto startup = reinterpret_cast<uint8_t *>(address+0x25C8E);
+                auto systemContext = reinterpret_cast<uint8_t *>(address+0xB09B0);
+                auto mediaContext = reinterpret_cast<uint8_t *>(address+0xBE8A0);
+                if (!memcmp(startup,testVCS0,sizeof(testVCS0)) &&
+                    !memcmp(systemContext,context0,sizeof(context0)) &&
+                    !memcmp(mediaContext,context0,sizeof(context0))) {
+                    auto replace = [&](uint8_t *site,const uint8_t *from,const uint8_t *to,size_t length) {
+                        KernelPatcher::LookupPatch patch {kext,from,to,length,1};
+                        patcher.clearError();
+                        patcher.applyLookupPatch(&patch,site,length+1);
+                        return patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,to,length);
+                    };
+                    videoRoutingReady = replace(startup,testVCS0,testVCS2,sizeof(testVCS0)) &&
+                        replace(systemContext,context0,context2,sizeof(context0)) &&
+                        replace(mediaContext,context0,context2,sizeof(context0));
+                }
+            }
+			patcher.clearError();
+			// r124: resolve_ccs places its state at cursor+4096-alignedSize,
+			// but asks the pool for only two DWORDs. After the 0x9B8-byte init
+			// batch this overruns the 4KiB buffer and truncates binding pointers.
+			// Reserve the full usable page (4096 minus the native 8-byte trailer).
+			// Native getBufferPtrNoInc then submits any pending init and rotates
+			// to a fresh buffer with event ownership intact. Do not alter CCS or
+			// fake completion. DP1 and20G have the same pool reservation contract.
+			static const uint8_t ccsFind[] {0xBE,0x02,0x00,0x00,0x00};
+			static const uint8_t ccsReplace[] {0xBE,0xFE,0x03,0x00,0x00};
+			static const uint8_t ccsPoolBytes[] {0x48,0xC7,0x05,0xF3,0xD6,0x0C,0x00,0x00,0x10,0x00,0x00};
+			static const uint8_t ccsTrailer[] {0xBB,0x08,0x00,0x00,0x00};
+			auto ccsSite=reinterpret_cast<uint8_t *>(address+0x8CB80);
+			bool ccsReady=skuReady && size>0x8D4E0 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,
+					"__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE",address,size)==address+0x8CB2A &&
+				!memcmp(ccsSite,ccsFind,sizeof(ccsFind)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x7DAEA),ccsPoolBytes,sizeof(ccsPoolBytes)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x7DB01),ccsTrailer,sizeof(ccsTrailer));
+			patcher.clearError();
+			if (ccsReady) {
+				KernelPatcher::LookupPatch patch {kext,ccsFind,ccsReplace,sizeof(ccsFind),1};
+				patcher.applyLookupPatch(&patch,ccsSite,sizeof(ccsFind)+1);
+				ccsReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsSite,ccsReplace,sizeof(ccsReplace));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSPageReservationReady",ccsReady);
+			patcher.clearError();
+			// r287: HiZ resolve lays out commands/state relative to cursor+4096,
+			// but requests only the *remaining* pool space, so the pool never
+			// rotates before the emitter runs across its mapped 4 KiB page.
+			// Reserve the full usable page, as for the r124 color resolver.
+			static const uint8_t hizFind[] {0x48,0x8B,0xB3,0x50,0x18,0,0,0x48,0x2B,0xB3,0x58,0x18,0,0,0x48,0xC1,0xEE,0x02,0x83,0xC6,0xFE};
+			uint8_t hizReplace[sizeof(hizFind)];memset(hizReplace,0x90,sizeof(hizReplace));
+			hizReplace[0]=0xBE;hizReplace[1]=0xFE;hizReplace[2]=0x03;hizReplace[3]=0;hizReplace[4]=0;
+			auto hizSite=reinterpret_cast<uint8_t *>(address+0x85AFA);
+			bool hizReady=ccsReady && size>0x8B0C2 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,
+					"__Z14resolve_hiz_g7P25IOAccelCommandBufferPool2P14IGMappedBufferP22depth_resolve_params_tR15resolve_phase_tRjS7_yb",address,size)==address+0x85A8C &&
+				!memcmp(hizSite,hizFind,sizeof(hizFind));
+			patcher.clearError();
+			if(hizReady) {
+				KernelPatcher::LookupPatch patch {kext,hizFind,hizReplace,sizeof(hizFind),1};
+				patcher.applyLookupPatch(&patch,hizSite,sizeof(hizFind)+1);
+				hizReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(hizSite,hizReplace,sizeof(hizReplace));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLHiZPageReservationReady",hizReady);
+			patcher.clearError();
+			// The original block emits type2 with Fast Clear Enable=0, a
+			// forbidden pairing. Only this exact emitter's type2 gains bit8.
+			static const uint8_t ccsPSBlock[] {0xC1,0xE0,0x06,0x83,0xC8,0x02,0x66,0x41,0x89,0x87,0xA0,0,0,0,0x66,0x41,0xC7,0x87,0xA2,0,0,0,0x80,0x1F};
+			static const uint8_t ccsPSType[] {0x8B,0x42,0x64,0x83,0xE0,0x03};
+			auto ccsPSSite=reinterpret_cast<uint8_t *>(address+0x8D056);
+			bool ccsPSReady=ccsReady &&
+				!memcmp(ccsPSSite,ccsPSBlock,sizeof(ccsPSBlock)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x8D02B),ccsPSType,sizeof(ccsPSType));
+			if (ccsPSReady) {
+				tglCCSPSResume=address+0x8D06E;
+				uint8_t jump[14] {0xFF,0x25,0,0,0,0};
+				const auto target=reinterpret_cast<uintptr_t>(tglCCSPSBridge);
+				memcpy(jump+6,&target,sizeof(target));
+				patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(ccsPSSite),jump,sizeof(jump));
+				ccsPSReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsPSSite,jump,sizeof(jump));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSFastClearZeroReady",ccsPSReady);
+			patcher.clearError();
+			bool ggttOK=size>0x10730 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable8mapRangeERK14IGAddressRangeyy",address,size)==address+0x10324 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable15mapRangeRotatedER33IGAddressRangeRotatedPageIteratorR25IGPhysicalSegmentIteratory",address,size)==address+0x103A0 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable10unmapRangeERK14IGAddressRange",address,size)==address+0x10626 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable13mapRangeDummyERK14IGAddressRangey",address,size)==address+0x10680;
+			// Validate ALL sites before the first mutation. Admission fails if any
+			// write fails; never run a partly adapted mapping lifecycle.
+			for (const auto &p:tglGGTTPatches)
+				ggttOK=ggttOK && !memcmp(reinterpret_cast<void *>(address+p.offset),p.before,p.size);
+			patcher.clearError();
+			if (ggttOK) for (const auto &p:tglGGTTPatches) {
+				KernelPatcher::LookupPatch patch {kext,p.before,p.after,p.size,1};
+				auto site=reinterpret_cast<uint8_t *>(address+p.offset);
+				patcher.applyLookupPatch(&patch,site,p.size+1);
+				ggttOK=ggttOK && patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,p.after,p.size);
+				if (!ggttOK) break;
+			}
+			// Shared commitRange supplies PPGTT PAT/RW flags (scanout:0x8A),
+			// while Gen12 GGTT system-memory entries use address|present.
+			// Keep the native iterators, stores and invalidation; correct only
+			// AlderLakeN's flags mask in the linear and rotated GGTT writers.
+			bool systemFlagsOK=!adlnDetected;
+			if(adlnDetected) {
+				static const uint32_t offsets[] {0x1033D,0x104D2};
+				static const uint8_t find[] {0x48,0xB8,0xFE,0x0F,0x00,0x00,0x80,0xFF,0xFF,0xFF};
+				static const uint8_t replace[] {0x48,0xB8,0,0,0,0,0,0,0,0};
+				systemFlagsOK=ggttOK;
+				for(auto offset:offsets)systemFlagsOK=systemFlagsOK &&
+					!memcmp(reinterpret_cast<void *>(address+offset),find,sizeof(find));
+				if(systemFlagsOK)for(auto offset:offsets) {
+					auto site=reinterpret_cast<uint8_t *>(address+offset);
+					KernelPatcher::LookupPatch patch {kext,find,replace,sizeof(find),1};
+					patcher.clearError();patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					systemFlagsOK=systemFlagsOK && patcher.getError()==KernelPatcher::Error::NoError &&
+						!memcmp(site,replace,sizeof(replace));
+					if(!systemFlagsOK)break;
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("N97NativeGGTTSystemFlagsReady",systemFlagsOK);
+			}
+			ggttOK=ggttOK && systemFlagsOK;
+			// Gen12 GGTT bit1 selects local memory. Preserve the entire GOP /
+			// stolen prefix, rather than changing its attributes during init.
+			// Native initSegments reserves this prefix from GGC; normal global
+			// allocations start at96MiB. The later dummy-PTE initialization stays.
+			bool reservedOK=!adlnDetected;
+			if (adlnDetected) {
+				static const uint8_t find[] {0x77,0x4C},replace[] {0xEB,0x4C};
+				auto site=reinterpret_cast<uint8_t *>(address+0x1024E);
+				reservedOK=ggttOK && size>0x10311 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,
+					"__ZN25IGHardwareGlobalPageTable15initWithOptionsEP16IntelAcceleratorRK14IGAddressRangePvyj",address,size)==address+0x101B4 &&
+					!memcmp(site,find,sizeof(find));
+				patcher.clearError();
+				if (reservedOK) {
+					KernelPatcher::LookupPatch patch {kext,find,replace,sizeof(find),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					reservedOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("N97NativeGOPPTEPreservation",reservedOK);
+			}
+			ggttOK=ggttOK && reservedOK;
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLGGTT64Writes",ggttOK);
+			patcher.clearError();
+	videoRoutingReadyOut=videoRoutingReady; ccsReadyOut=ccsReady; hizReadyOut=hizReady; ccsPSReadyOut=ccsPSReady; ggttOKOut=ggttOK;
+}
+
+static __attribute__((noinline)) bool tglCheckCPSHelpers(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+			// Check native helper bytes BEFORE existing GuC diagnostic routes.
+			// PRM Vol2c part1 pp121-124: valid + force even for empty ring restore.
+			static const uint8_t cpsAllocHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x41,0x89,0xce,0x41,0x89,0xd7,0x49,0x89,0xf4};
+			static const uint8_t cpsCPUHead[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x47,0x38,0x5d,0xc3};
+			static const uint8_t cpsGPUHead[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x7f,0x30,0x48,0x8b,0x7,0x5d,0xff,0xa0,0x28,0x1,0x0,0x0};
+			static const uint8_t cpsPointer[] {0x49,0x8b,0x45,0x50,0x48,0x8b,0xb8,0xf8,0x13,0x0,0x0,0x48,0x85,0xff,0x74,0x13,0xe8,0x5f,0x7c,0xf9,0xff,0x83,0xc8,0x1,0x41,0x89,0x87,0x4c,0x10,0x0,0x0,0x49,0x8b,0x45,0x50};
+			static const uint8_t cpsRelease[] {0x49,0x8b,0xbf,0xf8,0x13,0x0,0x0,0x48,0x85,0xff,0x74,0x6,0x48,0x8b,0x7,0xff,0x50,0x28,0x49,0xc7,0x87,0xf8,0x13,0x0,0x0,0x0,0x0,0x0,0x0};
+			bool cpsOK=size>0x7C263 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGSharedMappedBuffer11withOptionsEP11IGAccelTaskmjj",address,size)==address+0x10924 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK20IGSharedMappedBuffer17getVirtualAddressEv",address,size)==address+0x10B60 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK14IGMappedBuffer20getGPUVirtualAddressEv",address,size)==address+0x13E7C;
+			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x10924),cpsAllocHead,sizeof(cpsAllocHead));
+			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x10B60),cpsCPUHead,sizeof(cpsCPUHead));
+			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x13E7C),cpsGPUHead,sizeof(cpsGPUHead));
+			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x7C208),cpsPointer,sizeof(cpsPointer));
+			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x26683),cpsRelease,sizeof(cpsRelease));
+			patcher.clearError();
+	return cpsOK;
+}
+
+static __attribute__((noinline)) bool tglInstallHostVideoIRQ(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size, bool hostOK) {
+                // Qualify the complete parent bank owner, its native bank0
+                // readers and service consumer before installing retry ownership.
+                if(hostOK) {
+                 const char *symbol="__ZN17IGInterruptBridge22readAndClearInterruptsER8IGBitSetILm46EE";
+                 static const uint8_t head[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53};
+                 static const uint8_t tail[]={0x44,0x89,0xb8,0x1c,0,0x19,0};
+                 const char *readers[]={
+                  "__ZN17IGInterruptBridge25readAndClearRCSInterruptsER8IGBitSetILm46EEj",
+                  "__ZN17IGInterruptBridge25readAndClearCCSInterruptsER8IGBitSetILm46EEj",
+                  "__ZN17IGInterruptBridge25readAndClearBCSInterruptsER8IGBitSetILm46EEj",
+                  "__ZN17IGInterruptBridge25readAndClearGuCInterruptsER8IGBitSetILm46EEj"};
+                 static const uint32_t offsets[]={0x4b0c0,0x4b116,0x4b16c,0x4b1c2};
+                 hostOK=size>0x4B480 &&
+                  patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size)==address+0x4AFF0 &&
+                  !memcmp(reinterpret_cast<void *>(address+0x4AFF0),head,sizeof(head)) &&
+                  !memcmp(reinterpret_cast<void *>(address+0x4B0AF),tail,sizeof(tail));
+                 for(unsigned n=0;n<4 && hostOK;++n) {
+                  const auto method=patcher.solveSymbol<mach_vm_address_t>(index,readers[n],address,size);
+                  hostOK=method==address+offsets[n];xelpIRQBank0[n]=reinterpret_cast<XELPIRQRead>(method);
+                 }
+                 const auto service=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGInterruptBridge17serviceInterruptsERK8IGBitSetILm46EE",address,size);
+                 const auto wake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator22SafeForceWakeInterruptEbj",address,size);
+                 hostOK=hostOK && service==address+0x4B3A0 && wake==address+0x2DA26;
+                 xelpIRQDispatch=reinterpret_cast<decltype(xelpIRQDispatch)>(service);
+                 xelpIRQWake=reinterpret_cast<decltype(xelpIRQWake)>(wake);
+                 patcher.clearError();
+                 KernelPatcher::RouteRequest videoIRQ {symbol,xelpVideoIRQ};
+                 if(hostOK && xelpIRQPrepare()) {
+                  hostOK=patcher.routeMultiple(index,&videoIRQ,1,address,size);
+                  xelpIRQInstalled=hostOK;
+                 }
+                 if(xelpIRQInstalled)if(auto live=OSSerializer::forTarget(nullptr,xelpIRQSerialize)) {
+                  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQState",live);live->release();
+                 }
+                 patcher.clearError();
+                }
+	return hostOK;
+}
+
+static __attribute__((noinline)) void tglInstallAdlnQueueTrace(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    bool adlnDetected, bool hostOK) {
+            if(adlnDetected && checkKernelArgument("-wex-adln-qtrace")) {
+             const char *create="__ZN19IGAccelCommandQueue29createHardwareContextIfNeededEh";
+             const char *process="__ZN19IGAccelCommandQueue20processCommandBufferEjj";
+             const char *pid="__ZNK19IOAccelCommandQueue16getOwningTaskPidEv";
+             static const uint8_t createHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xEC,0x18};
+             static const uint8_t processHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xFB};
+             static const uint8_t pidBody[] {0x55,0x48,0x89,0xE5,0x8B,0x87,0x78,0x05,0,0,0x5D,0xC3};
+             static const uint8_t contextStore[] {0x48,0x89,0x83,0xA8,6,0,0};
+             bool ready=hostOK && tglVM.enabled && tglVM.nofault && size>0x3007D &&
+              patcher.solveSymbol<mach_vm_address_t>(index,create,address,size)==address+0x2FD32 &&
+              patcher.solveSymbol<mach_vm_address_t>(index,process,address,size)==address+0x2FF98 &&
+              patcher.solveSymbol<mach_vm_address_t>(index,pid,address,size)==address+0x30072 &&
+              !memcmp(reinterpret_cast<void *>(address+0x2FD32),createHead,sizeof(createHead)) &&
+              !memcmp(reinterpret_cast<void *>(address+0x2FF98),processHead,sizeof(processHead)) &&
+              !memcmp(reinterpret_cast<void *>(address+0x30072),pidBody,sizeof(pidBody)) &&
+              !memcmp(reinterpret_cast<void *>(address+0x2FD88),contextStore,sizeof(contextStore));
+             patcher.clearError();
+             if(ready)adlnQueueTraceProcName=patcher.solveSymbol(KernelPatcher::KernelID,"_proc_name");
+             ready=ready && adlnQueueTraceProcName;patcher.clearError();
+             if(ready) {
+              KernelPatcher::RouteRequest trace[] {
+               {create,adlnQueueTraceCreate,adlnQueueTraceCreateOriginal},
+               {process,adlnQueueTraceProcess,adlnQueueTraceProcessOriginal}
+              };
+              ready=patcher.routeMultiple(index,trace,arrsize(trace),address,size);
+             }
+             patcher.clearError();adlnQueueTraceEnabled=ready;
+             IORegistryEntry::getRegistryRoot()->setProperty("N97QueueTraceReady",ready);
+            }
+}
+
+static __attribute__((noinline)) bool tglInstallIOSurfaceCCSPolicy(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+			// Keep IOSurface device-cache allocation uncompressed. The donor
+			// enables it again when the last external display disappears, even
+			// though its CPU-access resolve path can expose compressed bytes.
+			// Apply the policy before allocation, at both native flag writers;
+			// never relabel existing compressed resources or their AUX state.
+			// This complements the userspace ordinary-color allocation policy
+			// and is independent of model, panel presence and connector routing.
+			static const uint8_t iosCCSNative[] {0x45,0x88,0xBD,0x74,0x14,0,0,0x45,0x38,0xBD,0x8C,0x12,0,0,
+				0x75,0x0E,0x41,0xF6,0x06,0x20,0x74,0x08,0x41,0xC6,0x85,0x74,0x14,0,0,1};
+			static const uint8_t iosCCSInitial[] {0x41,0xC6,0x85,0x74,0x14,0,0,0};
+			static const uint8_t iosCCSSetNative[] {0x41,0x8A,0x07,0x41,0x88,0x86,0x74,0x14,0,0};
+			static const uint8_t iosCCSSet[] {0x31,0xC0,0x90,0x41,0x88,0x86,0x74,0x14,0,0};
+			const char *iosCCSPlatform="__ZN16IntelAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_";
+			bool iosCCSOK=size>0x959E3 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,iosCCSPlatform,address,size)==address+0x2B4F2 &&
+				!memcmp(reinterpret_cast<void *>(address+0x959D1),"renderCompression",18) &&
+				!memcmp(reinterpret_cast<void *>(address+0x246C3),iosCCSNative,sizeof(iosCCSNative)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x2B872),iosCCSSetNative,sizeof(iosCCSSetNative));
+			patcher.clearError();
+			if (iosCCSOK) {
+				patcher.routeBlock(address+0x246D9,iosCCSInitial,sizeof(iosCCSInitial));
+				iosCCSOK=patcher.getError()==KernelPatcher::Error::NoError &&
+					!memcmp(reinterpret_cast<void *>(address+0x246D9),iosCCSInitial,sizeof(iosCCSInitial));
+				patcher.clearError();
+				if (iosCCSOK) {
+					patcher.routeBlock(address+0x2B872,iosCCSSet,sizeof(iosCCSSet));
+					iosCCSOK=patcher.getError()==KernelPatcher::Error::NoError &&
+						!memcmp(reinterpret_cast<void *>(address+0x2B872),iosCCSSet,sizeof(iosCCSSet));
+					patcher.clearError();
+				}
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSPolicyReady",iosCCSOK);
+	return iosCCSOK;
+}
+
+static __attribute__((noinline)) void tglPatchFlushCPSContextAndRPCS(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    KernelPatcher::KextInfo *kext, bool adlnDetected, bool hostOK, bool gucOK,
+    bool &cpsOK, XELP::Family family, bool gsyncTargetMatch,
+    bool &flushOKOut, bool &completionCacheOKOut, bool &contextCacheOKOut) {
+			// r119: retain native RCS flush -> stamp order and all runtime address/
+			// notification fields. Gen12 flushes HDC before completion; Linux v6.12
+			// gen12_emit_fini_breadcrumb_rcs also requires DepthStall (1409600907).
+			// The observed RCS hang was at the stamp PIPE_CONTROL after this flush.
+			// r134: use r131's qualified flush ordering as the comparison baseline.
+			// TGL PRM Vol14 UP3/UP4/H35 p51 substitutes HDC flush + state
+			// invalidation for constant-cache invalidation (RCS/CCS hang erratum).
+			// The previous packet already stalls CS. Also invalidate command cache
+			// to cover Vol2a p1129's conditional state-cache redirect requirement.
+			// Keep packet count, scratch writes, ISP, notification and wait fields.
+			// This is a repair candidate; concurrent execution is not yet proven.
+			static const uint32_t flushSites[] {0x84E5D,0x85406,0x51A20,0x51A3A};
+			static const uint8_t flushFind[][10] {
+				{0x48,0xB8,0x04,0x00,0x00,0x7A,0x21,0x50,0x10,0x40},
+				{0x48,0xB9,0x04,0x00,0x00,0x7A,0x21,0x50,0x10,0x40},
+				{0x48,0xBF,0x04,0x00,0x00,0x7A,0x21,0x52,0x10,0x40},
+				{0x48,0xBB,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x00}};
+			static const uint8_t flushReplace[][10] {
+				{0x48,0xB8,0x04,0x02,0x00,0x7A,0x21,0x70,0x10,0x40},
+				{0x48,0xB9,0x04,0x02,0x00,0x7A,0x21,0x70,0x10,0x40},
+				{0x48,0xBF,0x04,0x02,0x00,0x7A,0x21,0x72,0x10,0x50},
+				{0x48,0xBB,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x20}};
+			bool flushOK=size>0x85410 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain18commitStampCommandEjb",address,size)==address+0x84DC8 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain10writeFlushEv",address,size)==address+0x853A6;
+			static const uint8_t renderFlushWait[] {0x48,0xBB,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x00};
+			flushOK=flushOK &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent",address,size)==address+0x4F1F0 &&
+				!memcmp(reinterpret_cast<void *>(address+0x51A3A),renderFlushWait,sizeof(renderFlushWait));
+			for (size_t n=0;flushOK && n<arrsize(flushSites);++n)
+				flushOK=!memcmp(reinterpret_cast<void *>(address+flushSites[n]),flushFind[n],sizeof(flushFind[n]));
+			patcher.clearError();
+			for (size_t n=0;flushOK && n<arrsize(flushSites);++n) {
+				auto site=reinterpret_cast<uint8_t *>(address+flushSites[n]);
+				KernelPatcher::LookupPatch patch {kext,flushFind[n],flushReplace[n],sizeof(flushFind[n]),1};
+				patcher.applyLookupPatch(&patch,site,sizeof(flushFind[n])+1);
+				flushOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,flushReplace[n],sizeof(flushReplace[n]));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSCompletionFlushReady",flushOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassFlushReady",flushOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassTileFlushReady",flushOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassConstAlternativeReady",flushOK);
+			// The outer RCS completion emitter is separate from the render-pass
+			// emitter above. Apply the same Vol14 constant-cache alternative to
+			// its stamp and optional notification packets on the qualified Tahoe
+			// host-scheduler target. Preserve native GTT mode, stamp address/value,
+			// notification selection, packet lengths and the preceding CS stall.
+			const bool tahoeTrialScope=!adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
+				(XELP::kernelOS(version)==XELP::OS::Tahoe);
+			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
+			// Linux applies Wa_18022495364 to TGL, ADL and RPL (Xe_LP 12.00-12.10).
+			// The ADL-N backend also drives ADL-P/RPL-P; on by default on the same
+			// Tahoe host-scheduler target, -wex-no-adln-ctx-invalidate turns it off.
+			// That scope only enables the indirect trial and declines an unqualified
+			// image per context instead of failing construction.
+			const bool adlnContextCacheRequested=adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
+				(XELP::kernelOS(version)==XELP::OS::Tahoe) && !checkKernelArgument("-wex-no-adln-ctx-invalidate");
+			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
+			TGLContextCache::soft()=adlnContextCacheRequested;
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
+			// Preserve native submission; use its one-shot force-restore flag only
+			// for a witnessed equal-tail resubmission of the active first item.
+			static const uint8_t sameTailFlag[] {0x41,0x80,0xBD,0xC9,0,0,0,0,0x74,0x10,0x41,0xC6,0x85,0xC9,0,0,0,0,0x89,0xC8,0x83,0xC8,0x04,0x89,0x45,0xC0};
+			tglSameTailEnabled=tahoeTrialScope && hostOK && size>0x7C5D7 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGHardwareContext14updateRingTailEj",address,size)==address+0x7C5B6 &&
+				!memcmp(reinterpret_cast<void *>(address+0x3A7B6),sameTailFlag,sizeof(sameTailFlag));
+			patcher.clearError();
+			tglSameTailRestoreEnabled=tglSameTailEnabled && !(tglTahoeDisabledTrials&4);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailRestoreReady",tglSameTailRestoreEnabled);
+			// The public TGL register definition identifies colored GSYNC at
+			// B0A0[2]. Restrict this repair trial to the physical TGL B0 target,
+			// exact Tahoe kernel/donor and the qualified strong-UC mapping.
+			const bool gsyncQualified=tglSameTailEnabled && tglMMIOUCReady &&
+				gsyncTargetMatch;
+			tglGSYNCObserveReady=gsyncQualified;
+			tglGSYNCReady=gsyncQualified && !(tglTahoeDisabledTrials&8);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLGSYNCDisableReady",tglGSYNCReady);
+			if(tglGSYNCObserveReady)if(auto live=OSSerializer::forTarget(nullptr,tglGSYNCSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLGSYNCLive",live);live->release();
+			}
+			if(tglSameTailEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglSameTailSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailLive",live);live->release();
+			}
+			bool completionCacheOK=!completionCacheRequested;
+			if(completionCacheRequested) {
+				static const uint32_t completionCacheSites[] {0x84EA4,0x84F95};
+				static const uint8_t completionCacheFind[][10] {
+					{0x48,0xB8,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x01},
+					{0x48,0xB8,0x04,0x00,0x00,0x7A,0x18,0x05,0x00,0x01}};
+				static const uint8_t completionCacheReplace[][10] {
+					{0x48,0xB8,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x21},
+					{0x48,0xB8,0x04,0x02,0x00,0x7A,0x14,0x05,0x00,0x21}};
+				completionCacheOK=hostOK && flushOK && size>0x84FD5 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain18commitStampCommandEjb",address,size)==address+0x84DC8;
+				for(size_t n=0;completionCacheOK && n<arrsize(completionCacheSites);++n)
+					completionCacheOK=!memcmp(reinterpret_cast<void *>(address+completionCacheSites[n]),completionCacheFind[n],sizeof(completionCacheFind[n]));
+				patcher.clearError();
+				for(size_t n=0;completionCacheOK && n<arrsize(completionCacheSites);++n) {
+					auto site=reinterpret_cast<uint8_t *>(address+completionCacheSites[n]);
+					KernelPatcher::LookupPatch patch {kext,completionCacheFind[n],completionCacheReplace[n],sizeof(completionCacheFind[n]),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(completionCacheFind[n])+1);
+					completionCacheOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,completionCacheReplace[n],sizeof(completionCacheReplace[n]));
+				}
+				patcher.clearError();
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeRequested",completionCacheRequested);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeReady",completionCacheRequested && completionCacheOK);
+			const char *cpsRestore="__ZN17IGHardwareContext20restoreFromSafeImageEv";
+			static const uint8_t cpsRestoreHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+			static const uint8_t cpsRestoreCall[] {0x4c,0x89,0xef,0xe8,0x61,0x2,0x0,0x0};
+			cpsOK=cpsOK && patcher.solveSymbol<mach_vm_address_t>(index,cpsRestore,address,size)==address+0x7C392 &&
+				!memcmp(reinterpret_cast<void *>(address+0x7C392),cpsRestoreHead,sizeof(cpsRestoreHead)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x7C129),cpsRestoreCall,sizeof(cpsRestoreCall));
+			cpsOK=cpsOK && hostOK && gucOK;
+			patcher.clearError();
+			if(cpsOK) {
+				static const uint8_t find[] {0x83,0xC8,1},replace[] {0x83,0xC8,5};
+				auto site=reinterpret_cast<uint8_t *>(address+0x7C21D);
+				KernelPatcher::LookupPatch patch {kext,find,replace,sizeof(find),1};
+				patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+				cpsOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+				if(cpsOK) {tglCPSAllocate=address+0x10924;tglCPSCPUAddress=address+0x10B60;tglCPSGPUAddress=address+0x13E7C;}
+			}
+			patcher.clearError();
+			if(cpsOK) {
+				tglCPSRestoreCaller=address+0x7C131;
+				KernelPatcher::RouteRequest route[] {{cpsRestore,tglCPSRestore,tglCPSRestoreOriginal}};
+				cpsOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
+			}
+			patcher.clearError();
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
+			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
+			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
+			bool contextCacheOK=!contextCacheRequested;
+			if(contextCacheRequested) {
+				const char *init="__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh";
+				static const uint8_t contextCacheHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
+				contextCacheOK=cpsOK && hostOK && size>0x7C350 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,init,address,size)==address+0x7B9D4 &&
+					!memcmp(reinterpret_cast<void *>(address+0x7B9D4),contextCacheHead,sizeof(contextCacheHead));
+				patcher.clearError();
+				if(contextCacheOK) {
+					KernelPatcher::RouteRequest route[] {{init,tglContextCacheInit,tglContextCacheInitOriginal}};
+					contextCacheOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
+				}
+				patcher.clearError();
+			}
+			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
+			// Render compression goes through a per-task aux table, and the donor asks the engine to drop its
+			// cached entries only after it has changed a mapping. Linux also asks on every context restore, in the
+			// batch this plugin already installs for Wa_18022495364. -wex-no-aux-inv leaves that out.
+			tglContextAuxInvalidate=tglContextCacheEnabled && !checkKernelArgument("-wex-no-aux-inv");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextAuxInvalidateSelected",tglContextAuxInvalidate);
+			// Linux programs Wa_1409804808 and Wa_14010229206 on every integrated Xe-LP, and Wa_1607297627 on
+			// Tiger Lake, Rocket Lake and Alder Lake-P, which there covers Alder Lake-N and Raptor Lake-P. The donor
+			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
+			// -wex-no-engine-wa keeps the donor's values.
+			tglEngineWorkarounds=cpsOK && family!=XELP::Family::Unknown && !checkKernelArgument("-wex-no-engine-wa");
+			tglContextHiZSampler=tglEngineWorkarounds && !checkKernelArgument("-wex-no-ctx-hiz-wa");
+			tglEngineSemaphoreIdle=tglEngineWorkarounds && family!=XELP::Family::AlderLakeS &&
+				family!=XELP::Family::RaptorLakeS;
+			// The second render ring is in use outside Tiger Lake only with -wex-parallel-compute; on Tiger Lake
+			// its register stays with the donor's own workaround mask.
+			tglEngineSemaphoreIdleCompute=tglEngineSemaphoreIdle && family!=XELP::Family::TigerLake &&
+				checkKernelArgument("-wex-parallel-compute");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLEngineWorkaroundsSelected",
+				uint32_t(tglEngineWorkarounds)|uint32_t(tglEngineSemaphoreIdle)<<1|uint32_t(tglEngineSemaphoreIdleCompute)<<2,32);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheIndirectReady",tglContextCacheEnabled);
+			if(tglContextCacheEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglContextCacheSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheLive",live);live->release();
+			}
+			// The native RCS constructor initializes RPCS with ENABLE alone.
+			// Request the one TGL slice explicitly, as intel_sseu_make_rpcs does.
+			// Preserve the instruction and native ownership/lifetime of the image.
+			tglRPCSPowerReady=gsyncQualified && !(tglTahoeDisabledTrials&16) && contextCacheOK && cpsOK && hostOK && size>0x7C331 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",address,size)==address+0x7B9D4 &&
+				!memcmp(reinterpret_cast<void *>(address+0x7C313),TGLRPCS::Find,sizeof(TGLRPCS::Find));
+			patcher.clearError();
+			if(tglRPCSPowerReady) {
+				KernelPatcher::LookupPatch patch {kext,TGLRPCS::Find,TGLRPCS::Replace,sizeof(TGLRPCS::Find),1};
+                patcher.applyLookupPatch(&patch,reinterpret_cast<uint8_t *>(address+0x7C313),sizeof(TGLRPCS::Find)+1);
+				tglRPCSPowerReady=patcher.getError()==KernelPatcher::Error::NoError &&
+				 !memcmp(reinterpret_cast<void *>(address+0x7C313),TGLRPCS::Replace,sizeof(TGLRPCS::Replace));
+			}
+			patcher.clearError();
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRPCSFullSliceReady",tglRPCSPowerReady);
+			if(tglRPCSPowerReady)if(auto live=OSSerializer::forTarget(nullptr,tglRPCSPowerSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLRPCSPowerLive",live);live->release();
+			}
+            if(adlnDetected && checkKernelArgument("-wex-adln-golden-source")) {
+             adlnOwnedGoldenEnabled=cpsOK && !checkKernelArgument("-wex-adln-kernel-ctx") && !checkKernelArgument("-wex-adln-golden-raw");
+             IORegistryEntry::getRegistryRoot()->setProperty("N97OwnedGoldenReady",adlnOwnedGoldenEnabled);
+             if(auto capture=OSSerializer::forTarget(nullptr,adlnOwnedGoldenSerialize)) {
+              IORegistryEntry::getRegistryRoot()->setProperty("N97OwnedGoldenCapture",capture);capture->release();
+             }
+            }
+			if(adlnDetected && checkKernelArgument("-wex-adln-golden-raw")) {
+				const char *copy="__ZNK17IGHardwareContext16copyContextImageEPP24IOBufferMemoryDescriptorS2_";
+				static const uint8_t head[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+				bool ok=cpsOK && patcher.solveSymbol<mach_vm_address_t>(index,copy,address,size)==address+0x7C762 &&
+				 !memcmp(reinterpret_cast<void *>(address+0x7C762),head,sizeof(head));
+				patcher.clearError();
+				if(ok) {
+				 tglAlderLakeNGoldenCopyCaller=address+0x25E60;
+				 KernelPatcher::RouteRequest route[] {{copy,tglAlderLakeNGoldenCopy,tglAlderLakeNGoldenCopyOriginal}};
+				 ok=patcher.routeMultiple(index,route,arrsize(route),address,size);
+				}
+				patcher.clearError();tglAlderLakeNGoldenEnabled=ok;
+				IORegistryEntry::getRegistryRoot()->setProperty("N97GoldenRawReady",ok);
+				if(auto live=OSSerializer::forTarget(nullptr,tglAlderLakeNGoldenSerialize)) {
+				 IORegistryEntry::getRegistryRoot()->setProperty("N97GoldenRawCapture",live);live->release();
+				}
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglCPSSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeLive",live);live->release();
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglContextWaSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextWorkaroundsLive",live);live->release();
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglEarlyReadSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLEarlyReadLive",live);live->release();
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglStateRedirectSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLStateRedirectLive",live);live->release();
+			}
+	flushOKOut=flushOK; completionCacheOKOut=completionCacheOK; contextCacheOKOut=contextCacheOK;
+}
+
+static __attribute__((noinline)) void tglInstallTLBPreparserAndSemaphore(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    bool hostOK, bool &tlbPreparserOKOut, bool &semaphoreTLBOKOut) {
+			// Reserve the extra two DWORDs through the same virtual space method
+			// used by waitForSpace. Validate the native dispatch/pending-bit contract.
+			const char *tlbSpace="__ZN24IGHardwareRingBufferMain16getFlushTLBSpaceEv";
+			const char *tlbWrite="__ZN24IGHardwareRingBufferMain13writeFlushTLBEv";
+			const char *ringWrite="__ZN20IGHardwareRingBuffer11writeBufferEPjj";
+			static const uint8_t tlbSpaceBody[] {0x55,0x48,0x89,0xE5,0x48,0x8B,0x47,0x10,0x0F,0xBA,0xA0,0xD6,0x0F,0,0,0x10,0xB9,6,0,0,0,0xB8,0x0C,0,0,0,0x0F,0x43,0xC1,0x5D,0xC3};
+			static const uint8_t tlbWriteHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
+			static const uint8_t tlbReserveCall[] {0xFF,0x90,0x50,0x01,0,0,0x44,0x01,0xE8,0x41,0xC6,0x46,0x6D,1};
+			static const uint8_t tlbPendingCall[] {0x48,0xF7,0xD6,0x48,0x21,0xF7,0x48,0x89,0xBC,0xD0,0x40,0x13,0,0,0x49,0x8B,0x06,0x4C,0x89,0xF7,0xFF,0x90,0x60,1,0,0};
+			bool tlbPreparserOK=hostOK && size>0x8520E &&
+				patcher.solveSymbol<mach_vm_address_t>(index,tlbSpace,address,size)==address+0x8507C &&
+				patcher.solveSymbol<mach_vm_address_t>(index,tlbWrite,address,size)==address+0x8509C &&
+				patcher.solveSymbol<mach_vm_address_t>(index,ringWrite,address,size)==address+0x41E7A &&
+				!memcmp(reinterpret_cast<void *>(address+0x8507C),tlbSpaceBody,sizeof(tlbSpaceBody)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x8509C),tlbWriteHead,sizeof(tlbWriteHead)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x4177C),tlbReserveCall,sizeof(tlbReserveCall)) &&
+				!memcmp(reinterpret_cast<void *>(address+0x41ECA),tlbPendingCall,sizeof(tlbPendingCall));
+			patcher.clearError();
+			if(tlbPreparserOK) {
+				tglRCSWriteBuffer=address+0x41E7A;
+				KernelPatcher::RouteRequest tlb[] {
+					{tlbSpace,tglRCSTLBSpace,tglOrigRCSTLBSpace},
+					{tlbWrite,tglRCSTLBWrite,tglOrigRCSTLBWrite}
+				};
+				tlbPreparserOK=patcher.routeMultiple(index,tlb,arrsize(tlb),address,size);
+			}
+			patcher.clearError();
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSTLBPreparserReady",tlbPreparserOK);
+			if(auto live=OSSerializer::forTarget(nullptr,tglRCSTLBSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSTLBPreparserLive",live);live->release();
+			}
+            const char *baseSpace="__ZN20IGHardwareRingBuffer16getFlushTLBSpaceEv";
+            const char *baseWrite="__ZN20IGHardwareRingBuffer13writeFlushTLBEv";
+            const char *semCanUse="__ZN20IGHardwareRingBuffer23canUseSemaphoreWaitPollEi";
+            const char *semSpace="__ZN20IGHardwareRingBuffer25getSemaphoreWaitPollSpaceEi";
+            const char *semCommand="__ZN20IGHardwareRingBuffer30insertSemaphoreWaitPollCommandEPKN26IGSemaphoreWaitBufferQueue29SemaphoreWaitBufferDescriptorE";
+            static const uint8_t baseSpaceBody[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x47,0x10,0x8b,0x80,0xd6,0x0f,0,0,0xc1,0xe8,0x10,0x83,0xe0,1,0x8d,0x0c,0x80,0xb8,5,0,0,0,1,0xc8,0x5d,0xc3};
+            static const uint8_t semSpaceBody[] {0x55,0x48,0x89,0xe5,0xe8,0x3f,0xfe,0xff,0xff,0x0f,0xb6,0xc0,0x8d,0x04,0xc0,0x5d,0xc3};
+            static const uint8_t semCommandHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30};
+            static const uint8_t semMapCall[] {0xe8,0xcf,0x41,1,0,0x48,0x85,0xc0,0x74,0x0f,0x48,0x89,0xdf,0x48,0x89,0xc6,0xe8,0x45,0xfe,0xff,0xff};
+            bool semaphoreTLBOK=tlbPreparserOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,baseSpace,address,size)==address+0x428EC &&
+             patcher.solveSymbol<mach_vm_address_t>(index,baseWrite,address,size)==address+0x4290C &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semCanUse,address,size)==address+0x42440 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semSpace,address,size)==address+0x425F8 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semCommand,address,size)==address+0x4249E &&
+             !memcmp(reinterpret_cast<void *>(address+0x428EC),baseSpaceBody,sizeof(baseSpaceBody)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x4290C),tlbWriteHead,sizeof(tlbWriteHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x425F8),semSpaceBody,sizeof(semSpaceBody)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x4249E),semCommandHead,sizeof(semCommandHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x42644),semMapCall,sizeof(semMapCall));
+            patcher.clearError();
+            if(semaphoreTLBOK) {
+             tglCanUseSemaphore=address+0x42440;
+             KernelPatcher::RouteRequest routes[] {
+              {baseSpace,tglBaseTLBSpace,tglOrigBaseTLBSpace},
+              {baseWrite,tglBaseTLBWrite,tglOrigBaseTLBWrite},
+              {semSpace,tglSemaphoreSpace},
+              {semCommand,tglSemaphoreCommand,tglOrigSemaphoreCommand}
+             };
+             semaphoreTLBOK=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+            }
+            patcher.clearError();
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBReady",semaphoreTLBOK);
+            if(auto live=OSSerializer::forTarget(nullptr,tglSemaphoreSerialize)) {
+             IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBLive",live);live->release();
+            }
+	tlbPreparserOKOut=tlbPreparserOK; semaphoreTLBOKOut=semaphoreTLBOK;
+}
+
+static __attribute__((noinline)) void tglPatchHangPreStop(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    bool hangOK) {
+            // Exact failure-only wake call. Native STOP, wake ownership and all
+            // other callers remain unchanged; no instrumentation in normal submits.
+            if((XELP::kernelOS(version)==XELP::OS::Tahoe)) {
+             static const uint8_t before[] {0x41,0x89,0xf6,0x49,0x89,0xff,0x48,0x8b,0x7f,0x10,0xbe,1,0,0,0,0xba,7,0,0,0,0xe8,0x8e,0x22,0xfd,0xff};
+             static const uint8_t stop[] {0x42,0xc7,0x04,0x20,1,0,1,0};
+             bool ok=hangOK && size>0x569c6 &&
+              patcher.solveSymbol<mach_vm_address_t>(index,"__ZN11IGScheduler19haltCommandStreamerE10IGHwCsType",address,size)==address+0x56978 &&
+              !memcmp(reinterpret_cast<void *>(address+0x56983),before,sizeof(before)) &&
+              !memcmp(reinterpret_cast<void *>(address+0x569be),stop,sizeof(stop));
+             const int64_t delta=reinterpret_cast<int64_t>(tglHangPreStopBridge)-static_cast<int64_t>(address+0x5699c);
+             ok=ok && delta>=INT32_MIN && delta<=INT32_MAX;
+             if(ok) {
+              uint8_t call[5] {0xe8};const auto relative=static_cast<int32_t>(delta);memcpy(call+1,&relative,4);
+              patcher.clearError();patcher.routeBlock(address+0x56997,call,sizeof(call));
+              ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x56997),call,sizeof(call));
+             }
+             patcher.clearError();tglHangPreStopReady=ok;
+             IORegistryEntry::getRegistryRoot()->setProperty("TGLHangPreStopReady",ok);
+             IORegistryEntry::getRegistryRoot()->setProperty("TGLSubmitHistoryReady",ok && tglSameTailEnabled);
+            }
+}
+
+static __attribute__((noinline)) bool tglPrepareRecoveryResetPoll(
+    KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+    const char *recovery, bool hostOK, bool hasHostWait, mach_vm_address_t &submitOut) {
+				static const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10,
+					0x49,0x89,0xFF,0x4C,0x8B,0xB7,0x30,0x01,0,0,0x4C,0x8D,0x65,0xDC,0x49,0x8B,0x06,
+					0x49,0x8B,0x76,0x20,0x48,0x8B,0x9E,0xB8,0,0,0};
+				static const uint8_t failedAndResume[] {0xFF,0x83,0x7C,0x01,0,0,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,
+					0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0};
+				static const uint8_t successDispatch[] {0xFF,0x90,0x68,0x01,0,0,0x84,0xC0,0x74,0x09,0x41,0x80,0x7E,0x40,0,0x74,0x08,0xEB,0x72};
+				static const uint8_t successPath[] {0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0,
+					0x48,0x85,0xDB,0x74,0xDA,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x80,0x03,0,0,0x8B,0x73,0x20,0x48,0x8B,0x07,0xFF,0x90,0xD8,0x01,0,0,
+					0x48,0x89,0xDF,0xE8,0xFD,0xF9,0xFF,0xFF,0x8B,0x93,0x78,0x01,0,0,0x48,0x8D,0x75,0xD8,0x4C,0x89,0xF7,0xB9,0x40,0x42,0x0F,0,
+					0xE8,0xC4,0x54,0xFF,0xFF,0x84,0xC0,0x74,0xA0,0xFF,0x83,0x7C,0x01,0,0,0xEB,0x98};
+				static const uint8_t submitHead[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x10,0x48,0x8B,0x47,0x18,0xF6,0x80,0x78,0x0C,0,0,0x02};
+				const auto submit=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18IGAccelFIFOChannel18submitStampCommandEv",address,size);
+				// hostOK already qualifies and routes this exact sleep entry. Call
+				// the routed entry, as the native E8 does, not the saved trampoline.
+				bool recoveryOK=hostOK && hasHostWait && size>0xDF668 && submit==address+0x4C506 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,recovery,address,size)==address+0x4CA1E &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",address,size)==address+0x43576 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN12IGScheduler56resumeEv",address,size)==address+0x3906C &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CA1E),head,sizeof(head)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CA4C),successDispatch,sizeof(successDispatch)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x4CAD1),successPath,sizeof(successPath)) &&
+					!memcmp(reinterpret_cast<void *>(submit),submitHead,sizeof(submitHead));
+				patcher.clearError();
+				if (recoveryOK) {
+					// The native poll loses GDRST bits above bit 7 and can wait
+					// indefinitely. Preserve its exact entry/continuations, including
+					// scratch handling, and use its false exit on an unacknowledged reset.
+					static const uint8_t poll[] {0x4c,0x8d,0x3d,0xff,0x84,0x10,0x00,0x8b,0x88,0x1c,0x94,0x00,0x00,0x0f,0xb6,0xd9,0x8b,0x88,0xc4,0xce,0x00,0x00,0xf6,0xc1,0x01,0x74,0x1d,0xc7,0x80,0x00,0x41,0x00,0x00,0xb1,0xb1,0xf0,0xf0,0xc7,0x80,0x04,0x41,0x00,0x00,0xb2,0xb2,0xf0,0xf0,0x83,0xe1,0xfe,0x89,0x88,0xc4,0xce,0x00,0x00,0x4c,0x89,0xff,0x31,0xf6,0xba,0x0a,0x00,0x00,0x00,0xb9,0xe8,0x03,0x00,0x00,0xe8,0x00,0x00,0x00,0x00,0x31,0xff,0xe8,0x00,0x00,0x00,0x00,0x41,0x85,0x5c,0x24,0x70};
+					const int64_t delta=reinterpret_cast<int64_t>(tglResetPollBridge)-static_cast<int64_t>(address+0x43783);
+					static const uint8_t done[]{0x49,0x8b,0x44,0x24,0x50,0x75,0xa8,0xc7,0x80,0x08,0x4a,0,0,0,0,4,0};
+					// The two imported call displacements are relocated by the kernel.
+					recoveryOK=!memcmp(reinterpret_cast<void *>(address+0x4377e),poll,72) &&
+						!memcmp(reinterpret_cast<void *>(address+0x437ca),poll+76,3) &&
+						!memcmp(reinterpret_cast<void *>(address+0x437d1),poll+83,5) &&
+						!memcmp(reinterpret_cast<void *>(address+0x437d6),done,sizeof(done)) && delta>=INT32_MIN && delta<=INT32_MAX;
+					if(recoveryOK) {
+						tglResetPollSuccess=address+0x437dd;tglResetPollFailure=address+0x4374c;
+						uint8_t branch[5]{0xe9};const auto relative=static_cast<int32_t>(delta);memcpy(branch+1,&relative,4);
+						patcher.routeBlock(address+0x4377e,branch,sizeof(branch));
+						recoveryOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x4377e),branch,sizeof(branch));
+					}
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLResetDomainPollReady",recoveryOK);
+	submitOut=submit;
+	return recoveryOK;
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -12188,9 +13010,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  if(display13FramebufferRequested && !adlnOutputWiring.dsi) {
     const char *symbol="__ZN18IGAccelDisplayPipe23initFramebufferResourceEjP16IOAccelResource2";
     const auto target=patcher.solveSymbol(index,symbol,address,size);
-    const uint8_t call[]={0xe8,0xb8,0xfb,0xff,0xff};
-    const uint8_t layout[]={0x45,0x89,0xaf,0x94,0x01,0,0,0x41,0x89,0x87,0x90,0x01,0,0};
-    const uint8_t aperture[]={0x31,0xf6,0xff,0x90,0xa8,0x09,0,0};
+    static const uint8_t call[]={0xe8,0xb8,0xfb,0xff,0xff};
+    static const uint8_t layout[]={0x45,0x89,0xaf,0x94,0x01,0,0,0x41,0x89,0x87,0x90,0x01,0,0};
+    static const uint8_t aperture[]={0x31,0xf6,0xff,0x90,0xa8,0x09,0,0};
     const bool known=size>0x7f435 && target==address+0x7f160 &&
         !memcmp(reinterpret_cast<void *>(address+0x7f2dd),call,sizeof(call)) &&
         !memcmp(reinterpret_cast<void *>(address+0x7ef87),layout,sizeof(layout)) &&
@@ -12263,143 +13085,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.clearError();
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorSKUPatch", skuReady);
-			// r135: TGL B0 object-preemption topology corruption (Vol14 UP3 p53).
-			// One native immediate feeds both CS_DEBUG_MODE1 and CS_CHICKEN1.
-			// Keep its write mask and compute-preemption fields; clear only bit0.
-			const uint8_t objectPreemptFind[] {0xBA,0x01,0x00,0x01,0x00,0x89,0x90,0xEC,0x20,0x00,0x00};
-			const uint8_t objectPreemptReplace[] {0xBA,0x00,0x00,0x01,0x00,0x89,0x90,0xEC,0x20,0x00,0x00};
-			auto objectPreemptSite=reinterpret_cast<uint8_t *>(address+0x2516C);
-			bool objectPreemptOK=skuReady && size>0x251A1 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator19startGraphicsEngineEv",address,size)==address+0x25100 &&
-				!memcmp(objectPreemptSite,objectPreemptFind,sizeof(objectPreemptFind));
-			patcher.clearError();
-			if (objectPreemptOK) {
-				KernelPatcher::LookupPatch patch {currentGraphics,objectPreemptFind,objectPreemptReplace,sizeof(objectPreemptFind),1};
-				patcher.applyLookupPatch(&patch,objectPreemptSite,sizeof(objectPreemptFind)+1);
-				objectPreemptOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(objectPreemptSite,objectPreemptReplace,sizeof(objectPreemptReplace));
-			}
-			// r144: contexts can restore 2580 bit0 to1 (42/97 resident receipts).
-			// Select the global20EC bit0, which r135 clears and all97 receipts retain.
-			// Vol14 UP3 p53: object_preempt_en=20E0[14]?2580[0]:20EC[0].
-			const uint8_t objectSelectorFind[] {0xC7,0x80,0xE0,0x20,0,0,0,0x40,0,0x40};
-			const uint8_t objectSelectorReplace[] {0xC7,0x80,0xE0,0x20,0,0,0,0,0,0x40};
-			auto selectorSite=reinterpret_cast<uint8_t *>(address+0x25189);
-			bool selectorOK=objectPreemptOK && !memcmp(selectorSite,objectSelectorFind,sizeof(objectSelectorFind));
-			patcher.clearError();
-			if(selectorOK) {
-				KernelPatcher::LookupPatch patch {currentGraphics,objectSelectorFind,objectSelectorReplace,sizeof(objectSelectorFind),1};
-				patcher.applyLookupPatch(&patch,selectorSite,sizeof(objectSelectorFind)+1);
-				selectorOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(selectorSite,objectSelectorReplace,sizeof(objectSelectorReplace));
-			}
-			// r145: Linux Gen12 engine WA requires FF DOP clock gating disabled.
-			// Write20EC with mask bits1:0 (bit1 on, bit0 off), then restore EDX
-			// to r135's10000 before it also feeds2580. Do not alter compute mode.
-			// The replaced MMIO read was overwritten by the following MOV immediate.
-			const uint8_t ffDopFind[] {0x8B,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x89,0x90,0xEC,0x20,0,0};
-			const uint8_t ffDopReplace[] {0xBA,2,0,3,0,0x89,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x90};
-			auto ffDopSite=reinterpret_cast<uint8_t *>(address+0x25166);
-			bool ffDopOK=selectorOK && !memcmp(ffDopSite,ffDopFind,sizeof(ffDopFind));
-			patcher.clearError();
-			if(ffDopOK) {
-				KernelPatcher::LookupPatch patch {currentGraphics,ffDopFind,ffDopReplace,sizeof(ffDopFind),1};
-				patcher.applyLookupPatch(&patch,ffDopSite,sizeof(ffDopFind)+1);
-				ffDopOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffDopSite,ffDopReplace,sizeof(ffDopReplace));
-			}
-			// r146: TGL FF_MODE2 must not be CPU read/modify/written. Linux's
-			// Wa1608008084 programs TDS128 | GS224 with all other fields zero.
-			// Replace the conditional RMW as a whole, including its obsolete WA gate.
-			// Context restores receive the same value in the native-owned batch.
-			const uint8_t ffModeFind[] {0x0F,0xBA,0x63,0x18,0x1A,0x73,0x0A,0x81,0x88,0x04,0x66,0,0,0,0,4,0};
-			const uint8_t ffModeReplace[] {0xC7,0x80,0x04,0x66,0,0,0,0,4,0xE0,0x90,0x90,0x90,0x90,0x90,0x90,0x90};
-			auto ffModeSite=reinterpret_cast<uint8_t *>(address+0x2561C);
-			bool ffModeOK=ffDopOK && size>0x25637 && !memcmp(ffModeSite,ffModeFind,sizeof(ffModeFind));
-			patcher.clearError();
-			if(ffModeOK) {
-				KernelPatcher::LookupPatch patch {currentGraphics,ffModeFind,ffModeReplace,sizeof(ffModeFind),1};
-				patcher.applyLookupPatch(&patch,ffModeSite,sizeof(ffModeFind)+1);
-				ffModeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffModeSite,ffModeReplace,sizeof(ffModeReplace));
-			}
-			// Metal compute runs on the render engine, which the window server's drawing keeps preempting. For a GPGPU
-			// walker the donor asks for preemption between thread groups (0x60002, or mid-thread with a flags bit that is
-			// never set) and writes that level to 0x20E4, the global granularity that applies while r144 leaves
-			// per-context control off, and to 0x2580. Outside Tiger Lake a walker resumed that way can leave the command
-			// streamer stopped on it or on the PIPE_CONTROL after it, with the EUs idle: compute work in command buffers of
-			// up to a second hung the GPU within minutes while the screen was being composed, and never with the displays
-			// asleep. Preempt compute only between commands (0x60004, the level Intel's media driver programs under
-			// WaMidBatchPreemption): the window server gets the engine at the next walker boundary and no walker is
-			// resumed halfway. -wex-native-gpgpu-preempt keeps the donor's level.
-			const bool commandPreempt=xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
-				!checkKernelArgument("-wex-native-gpgpu-preempt");
-			const uint8_t gpgpuLevelFind[] {0x83,0xE1,0x02,0x81,0xF1,0x02,0x00,0x06,0x00};
-			const uint8_t gpgpuLevelReplace[] {0xB9,0x04,0x00,0x06,0x00,0x0F,0x1F,0x40,0x00};
-			auto gpgpuLevelSite=reinterpret_cast<uint8_t *>(address+0x2515D);
-			bool gpgpuLevelOK=commandPreempt && objectPreemptOK && !memcmp(gpgpuLevelSite,gpgpuLevelFind,sizeof(gpgpuLevelFind));
-			patcher.clearError();
-			if(gpgpuLevelOK) {
-				KernelPatcher::LookupPatch patch {currentGraphics,gpgpuLevelFind,gpgpuLevelReplace,sizeof(gpgpuLevelFind),1};
-				patcher.applyLookupPatch(&patch,gpgpuLevelSite,sizeof(gpgpuLevelFind)+1);
-				gpgpuLevelOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(gpgpuLevelSite,gpgpuLevelReplace,sizeof(gpgpuLevelReplace));
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUCommandPreemptionReady",gpgpuLevelOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFModeTimerReady",ffModeOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFDOPClockDisableReady",ffDopOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionGlobalReady",selectorOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
-			patcher.clearError();
-			// The donor picks its hardware workaround mask by PCI revision (InitTglLpHwWaTable): revisions 0 to 3,
-			// which in Linux's stepping tables is every Tiger Lake, get thirteen more workarounds than later ones.
-			// Raptor Lake-P is revision 4 and Alder Lake-P goes up to 0x0C, so there the donor leaves out
-			// workarounds that Linux applies on that silicon whatever the stepping. Add their bits to the
-			// later-revision mask, so that the donor's own engine start programs them: 23 FF_THREAD_MODE bit 19
-			// (Wa_14010919138), 38 COMMON_SLICE_CHICKEN4 bit 6 (Wa_1606376872), 47 ROW_CHICKEN4 bit 9
-			// (Wa_14010229206) and, where Linux applies Wa_1607297627, 43 RING_PSMI_CTL bits 7 and 12, with 44 for
-			// the second render ring when -wex-parallel-compute keeps it in use. The rest stay off: Linux has none
-			// of the writes they gate in its list for Alder or Raptor Lake. -wex-no-engine-wa leaves the mask alone.
-			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
-			   !checkKernelArgument("-wex-no-engine-wa")) {
-				uint64_t mask=0x1F8C5FEC00ULL|1ULL<<23|1ULL<<38|1ULL<<47;
-				if(xeProfile.family!=XELP::Family::AlderLakeS && xeProfile.family!=XELP::Family::RaptorLakeS)
-					mask|=1ULL<<43|(checkKernelArgument("-wex-parallel-compute")?1ULL<<44:0);
-				// movabs $0x1F8C5FEC00,%rcx; cmovb %r11,%rcx
-				const uint8_t maskFind[] {0x48,0xB9,0x00,0xEC,0x5F,0x8C,0x1F,0x00,0x00,0x00,0x49,0x0F,0x42,0xCB};
-				uint8_t maskReplace[sizeof(maskFind)];
-				memcpy(maskReplace,maskFind,sizeof(maskFind));memcpy(maskReplace+2,&mask,sizeof(mask));
-				auto maskSite=reinterpret_cast<uint8_t *>(address+0x7B720);
-				bool maskOK=size>0x7B72E &&
-					patcher.solveSymbol<mach_vm_address_t>(index,"__Z18InitTglLpHwWaTableP9_WA_TABLEP18_SKU_FEATURE_TABLEjtt",address,size)==address+0x7B6B6 &&
-					!memcmp(maskSite,maskFind,sizeof(maskFind));
-				patcher.clearError();
-				if(maskOK) {
-					KernelPatcher::LookupPatch patch {currentGraphics,maskFind,maskReplace,sizeof(maskFind),1};
-					patcher.applyLookupPatch(&patch,maskSite,sizeof(maskFind)+1);
-					maskOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(maskSite,maskReplace,sizeof(maskReplace));
-					patcher.clearError();
-				}
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLWorkaroundMaskReady",maskOK);
-			}
-			// Compute on the render engine (wrapTGLAcceleratorStart clears EnableMultiContext outside Tiger Lake):
-			// IntelTGLMemoryManager::newUnifiedAddressRangeAllocator reserves the upper canonical half of each
-			// task's address allocator only with multi-context on. Drop that test (`je` after the accelerator-flag
-			// test, two NOPs) so the reservation stays and the address layout is the one this donor has always
-			// run with; with multi-context on the patched code does what the native one does. Same site as
-			// -wex-tgl-nomc in SaqibAlMalik's tgl-stability branch, a port of NootedGreen's -ngreennomc.
-			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
-			   !checkKernelArgument("-wex-parallel-compute")) {
-				const uint8_t rangeFind[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x74,0x26,0x41,0xF6,0x46,0x24,0x02};
-				const uint8_t rangeReplace[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x90,0x90,0x41,0xF6,0x46,0x24,0x02};
-				auto rangeSite=reinterpret_cast<uint8_t *>(address+0x4BF0A);
-				bool rangeOK=size>0x4BF18 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21IntelTGLMemoryManager31newUnifiedAddressRangeAllocatorEP11IGAccelTask",address,size)==address+0x4BED8 &&
-					!memcmp(rangeSite,rangeFind,sizeof(rangeFind));
-				patcher.clearError();
-				if(rangeOK) {
-					KernelPatcher::LookupPatch patch {currentGraphics,rangeFind,rangeReplace,sizeof(rangeFind),1};
-					patcher.applyLookupPatch(&patch,rangeSite,sizeof(rangeFind)+1);
-					rangeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(rangeSite,rangeReplace,sizeof(rangeReplace));
-					patcher.clearError();
-				}
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeRangeReady",rangeOK);
-			}
+			const bool ffModeOK = tglPatchEnginePreemptionAndWA(patcher, index, address, size, currentGraphics, skuReady, xeProfile.family);
 			// r116: GT2 with 80 EU has ten enabled subslices, but the donor
 			// recognizes only twelve and leaves hwInfo+0x54 (URB banks) zero.
 			// The MTL allocator then underflows after reserving push constants.
@@ -12432,160 +13118,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				urbReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(urbSite,urbReplacement,sizeof(urbFind));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLURBBankTopologyReady",urbReady);
-            // getGPUInfo enumerates physical engines from 0x9140. Keep its mask
-            // and descriptors. Select that same engine for the startup context
-            // and for each media client's ring before native FIFO allocation.
-            bool videoRoutingReady = !mobilePrimaryVCS2;
-            if (mobilePrimaryVCS2 && urbReady && size > 0xBE8AC) {
-                const uint8_t testVCS0[] {0x41,0xF6,0x85,0,0x13,0,0,8};
-                const uint8_t testVCS2[] {0x41,0xF6,0x85,0,0x13,0,0,16};
-                const uint8_t context0[] {3,0,8,0,1,0,0,0,0,0,0,0};
-                const uint8_t context2[] {4,0,8,0,1,0,0,0,2,0,0,0};
-                auto startup = reinterpret_cast<uint8_t *>(address+0x25C8E);
-                auto systemContext = reinterpret_cast<uint8_t *>(address+0xB09B0);
-                auto mediaContext = reinterpret_cast<uint8_t *>(address+0xBE8A0);
-                if (!memcmp(startup,testVCS0,sizeof(testVCS0)) &&
-                    !memcmp(systemContext,context0,sizeof(context0)) &&
-                    !memcmp(mediaContext,context0,sizeof(context0))) {
-                    auto replace = [&](uint8_t *site,const uint8_t *from,const uint8_t *to,size_t length) {
-                        KernelPatcher::LookupPatch patch {currentGraphics,from,to,length,1};
-                        patcher.clearError();
-                        patcher.applyLookupPatch(&patch,site,length+1);
-                        return patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,to,length);
-                    };
-                    videoRoutingReady = replace(startup,testVCS0,testVCS2,sizeof(testVCS0)) &&
-                        replace(systemContext,context0,context2,sizeof(context0)) &&
-                        replace(mediaContext,context0,context2,sizeof(context0));
-                }
-            }
-			patcher.clearError();
-			// r124: resolve_ccs places its state at cursor+4096-alignedSize,
-			// but asks the pool for only two DWORDs. After the 0x9B8-byte init
-			// batch this overruns the 4KiB buffer and truncates binding pointers.
-			// Reserve the full usable page (4096 minus the native 8-byte trailer).
-			// Native getBufferPtrNoInc then submits any pending init and rotates
-			// to a fresh buffer with event ownership intact. Do not alter CCS or
-			// fake completion. DP1 and20G have the same pool reservation contract.
-			const uint8_t ccsFind[] {0xBE,0x02,0x00,0x00,0x00};
-			const uint8_t ccsReplace[] {0xBE,0xFE,0x03,0x00,0x00};
-			const uint8_t ccsPoolBytes[] {0x48,0xC7,0x05,0xF3,0xD6,0x0C,0x00,0x00,0x10,0x00,0x00};
-			const uint8_t ccsTrailer[] {0xBB,0x08,0x00,0x00,0x00};
-			auto ccsSite=reinterpret_cast<uint8_t *>(address+0x8CB80);
-			bool ccsReady=skuReady && size>0x8D4E0 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,
-					"__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE",address,size)==address+0x8CB2A &&
-				!memcmp(ccsSite,ccsFind,sizeof(ccsFind)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x7DAEA),ccsPoolBytes,sizeof(ccsPoolBytes)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x7DB01),ccsTrailer,sizeof(ccsTrailer));
-			patcher.clearError();
-			if (ccsReady) {
-				KernelPatcher::LookupPatch patch {currentGraphics,ccsFind,ccsReplace,sizeof(ccsFind),1};
-				patcher.applyLookupPatch(&patch,ccsSite,sizeof(ccsFind)+1);
-				ccsReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsSite,ccsReplace,sizeof(ccsReplace));
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSPageReservationReady",ccsReady);
-			patcher.clearError();
-			// r287: HiZ resolve lays out commands/state relative to cursor+4096,
-			// but requests only the *remaining* pool space, so the pool never
-			// rotates before the emitter runs across its mapped 4 KiB page.
-			// Reserve the full usable page, as for the r124 color resolver.
-			const uint8_t hizFind[] {0x48,0x8B,0xB3,0x50,0x18,0,0,0x48,0x2B,0xB3,0x58,0x18,0,0,0x48,0xC1,0xEE,0x02,0x83,0xC6,0xFE};
-			uint8_t hizReplace[sizeof(hizFind)];memset(hizReplace,0x90,sizeof(hizReplace));
-			hizReplace[0]=0xBE;hizReplace[1]=0xFE;hizReplace[2]=0x03;hizReplace[3]=0;hizReplace[4]=0;
-			auto hizSite=reinterpret_cast<uint8_t *>(address+0x85AFA);
-			bool hizReady=ccsReady && size>0x8B0C2 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,
-					"__Z14resolve_hiz_g7P25IOAccelCommandBufferPool2P14IGMappedBufferP22depth_resolve_params_tR15resolve_phase_tRjS7_yb",address,size)==address+0x85A8C &&
-				!memcmp(hizSite,hizFind,sizeof(hizFind));
-			patcher.clearError();
-			if(hizReady) {
-				KernelPatcher::LookupPatch patch {currentGraphics,hizFind,hizReplace,sizeof(hizFind),1};
-				patcher.applyLookupPatch(&patch,hizSite,sizeof(hizFind)+1);
-				hizReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(hizSite,hizReplace,sizeof(hizReplace));
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLHiZPageReservationReady",hizReady);
-			patcher.clearError();
-			// The original block emits type2 with Fast Clear Enable=0, a
-			// forbidden pairing. Only this exact emitter's type2 gains bit8.
-			const uint8_t ccsPSBlock[] {0xC1,0xE0,0x06,0x83,0xC8,0x02,0x66,0x41,0x89,0x87,0xA0,0,0,0,0x66,0x41,0xC7,0x87,0xA2,0,0,0,0x80,0x1F};
-			const uint8_t ccsPSType[] {0x8B,0x42,0x64,0x83,0xE0,0x03};
-			auto ccsPSSite=reinterpret_cast<uint8_t *>(address+0x8D056);
-			bool ccsPSReady=ccsReady &&
-				!memcmp(ccsPSSite,ccsPSBlock,sizeof(ccsPSBlock)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x8D02B),ccsPSType,sizeof(ccsPSType));
-			if (ccsPSReady) {
-				tglCCSPSResume=address+0x8D06E;
-				uint8_t jump[14] {0xFF,0x25,0,0,0,0};
-				const auto target=reinterpret_cast<uintptr_t>(tglCCSPSBridge);
-				memcpy(jump+6,&target,sizeof(target));
-				patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(ccsPSSite),jump,sizeof(jump));
-				ccsPSReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsPSSite,jump,sizeof(jump));
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSFastClearZeroReady",ccsPSReady);
-			patcher.clearError();
-			bool ggttOK=size>0x10730 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable8mapRangeERK14IGAddressRangeyy",address,size)==address+0x10324 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable15mapRangeRotatedER33IGAddressRangeRotatedPageIteratorR25IGPhysicalSegmentIteratory",address,size)==address+0x103A0 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable10unmapRangeERK14IGAddressRange",address,size)==address+0x10626 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable13mapRangeDummyERK14IGAddressRangey",address,size)==address+0x10680;
-			// Validate ALL sites before the first mutation. Admission fails if any
-			// write fails; never run a partly adapted mapping lifecycle.
-			for (const auto &p:tglGGTTPatches)
-				ggttOK=ggttOK && !memcmp(reinterpret_cast<void *>(address+p.offset),p.before,p.size);
-			patcher.clearError();
-			if (ggttOK) for (const auto &p:tglGGTTPatches) {
-				KernelPatcher::LookupPatch patch {currentGraphics,p.before,p.after,p.size,1};
-				auto site=reinterpret_cast<uint8_t *>(address+p.offset);
-				patcher.applyLookupPatch(&patch,site,p.size+1);
-				ggttOK=ggttOK && patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,p.after,p.size);
-				if (!ggttOK) break;
-			}
-			// Shared commitRange supplies PPGTT PAT/RW flags (scanout:0x8A),
-			// while Gen12 GGTT system-memory entries use address|present.
-			// Keep the native iterators, stores and invalidation; correct only
-			// AlderLakeN's flags mask in the linear and rotated GGTT writers.
-			bool systemFlagsOK=!adlnDetected;
-			if(adlnDetected) {
-				const uint32_t offsets[] {0x1033D,0x104D2};
-				const uint8_t find[] {0x48,0xB8,0xFE,0x0F,0x00,0x00,0x80,0xFF,0xFF,0xFF};
-				const uint8_t replace[] {0x48,0xB8,0,0,0,0,0,0,0,0};
-				systemFlagsOK=ggttOK;
-				for(auto offset:offsets)systemFlagsOK=systemFlagsOK &&
-					!memcmp(reinterpret_cast<void *>(address+offset),find,sizeof(find));
-				if(systemFlagsOK)for(auto offset:offsets) {
-					auto site=reinterpret_cast<uint8_t *>(address+offset);
-					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
-					patcher.clearError();patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
-					systemFlagsOK=systemFlagsOK && patcher.getError()==KernelPatcher::Error::NoError &&
-						!memcmp(site,replace,sizeof(replace));
-					if(!systemFlagsOK)break;
-				}
-				IORegistryEntry::getRegistryRoot()->setProperty("N97NativeGGTTSystemFlagsReady",systemFlagsOK);
-			}
-			ggttOK=ggttOK && systemFlagsOK;
-			// Gen12 GGTT bit1 selects local memory. Preserve the entire GOP /
-			// stolen prefix, rather than changing its attributes during init.
-			// Native initSegments reserves this prefix from GGC; normal global
-			// allocations start at96MiB. The later dummy-PTE initialization stays.
-			bool reservedOK=!adlnDetected;
-			if (adlnDetected) {
-				const uint8_t find[] {0x77,0x4C},replace[] {0xEB,0x4C};
-				auto site=reinterpret_cast<uint8_t *>(address+0x1024E);
-				reservedOK=ggttOK && size>0x10311 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,
-					"__ZN25IGHardwareGlobalPageTable15initWithOptionsEP16IntelAcceleratorRK14IGAddressRangePvyj",address,size)==address+0x101B4 &&
-					!memcmp(site,find,sizeof(find));
-				patcher.clearError();
-				if (reservedOK) {
-					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
-					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
-					reservedOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
-				}
-				IORegistryEntry::getRegistryRoot()->setProperty("N97NativeGOPPTEPreservation",reservedOK);
-			}
-			ggttOK=ggttOK && reservedOK;
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLGGTT64Writes",ggttOK);
-			patcher.clearError();
+			bool videoRoutingReady=false, ccsReady=false, hizReady=false, ccsPSReady=false, ggttOK=false;
+			tglPatchVideoCCSHiZAndGGTT(patcher, index, address, size, currentGraphics, skuReady, urbReady, mobilePrimaryVCS2, adlnDetected, videoRoutingReady, ccsReady, hizReady, ccsPSReady, ggttOK);
 
 			KernelPatcher::RouteRequest observations[] {
 				{"__ZN16IntelAccelerator5probeEP9IOServicePi", wrapTGLAcceleratorProbe, orgTGLAcceleratorProbe},
@@ -12600,7 +13134,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGAcceleratorObservationsRouted", observed);
 			bool adlnObserved=true;
 			if (adlnDetected) {
-				const uint8_t callbackEntry[] {0x55,0x48,0x89,0xE5,0x48,0x8B,0xBF,0x48,0x12,0,0};
+				static const uint8_t callbackEntry[] {0x55,0x48,0x89,0xE5,0x48,0x8B,0xBF,0x48,0x12,0,0};
 				const auto callback=patcher.solveSymbol<mach_vm_address_t>(index,
 				 "__ZN16IntelAccelerator36_ProcessNonDisplayInterruptsCallbackEP8OSObject",address,size);
 				adlnObserved=size>0x2A9B6 && callback==address+0x2A9A2 &&
@@ -12611,7 +13145,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					{"__ZN16IntelAccelerator10getGPUInfoEv",wrapAlderLakeNNativeGPUInfo,orgAlderLakeNNativeGPUInfo},
 					{"__ZN16IntelAccelerator19initInterruptBridgeEv",wrapAlderLakeNNativeIRQ,orgAlderLakeNNativeIRQ}
 				};
-				const uintptr_t offsets[] {0x28422,0x2847E,0x24BC0};
+				static const uintptr_t offsets[] {0x28422,0x2847E,0x24BC0};
 				for (unsigned i=0;i<arrsize(native);++i)
 					adlnObserved=adlnObserved && patcher.solveSymbol<mach_vm_address_t>(index,native[i].symbol,address,size)==address+offsets[i];
 				patcher.clearError();
@@ -12625,23 +13159,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const bool ok = patcher.routeMultiple(index, &request, 1, address, size);
 			SYSLOG("igfx", "TGL accelerator start route=%d", ok);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGAcceleratorStartRouted", ok);
-			// Check native helper bytes BEFORE existing GuC diagnostic routes.
-			// PRM Vol2c part1 pp121-124: valid + force even for empty ring restore.
-			const uint8_t cpsAllocHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x41,0x89,0xce,0x41,0x89,0xd7,0x49,0x89,0xf4};
-			const uint8_t cpsCPUHead[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x47,0x38,0x5d,0xc3};
-			const uint8_t cpsGPUHead[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x7f,0x30,0x48,0x8b,0x7,0x5d,0xff,0xa0,0x28,0x1,0x0,0x0};
-			const uint8_t cpsPointer[] {0x49,0x8b,0x45,0x50,0x48,0x8b,0xb8,0xf8,0x13,0x0,0x0,0x48,0x85,0xff,0x74,0x13,0xe8,0x5f,0x7c,0xf9,0xff,0x83,0xc8,0x1,0x41,0x89,0x87,0x4c,0x10,0x0,0x0,0x49,0x8b,0x45,0x50};
-			const uint8_t cpsRelease[] {0x49,0x8b,0xbf,0xf8,0x13,0x0,0x0,0x48,0x85,0xff,0x74,0x6,0x48,0x8b,0x7,0xff,0x50,0x28,0x49,0xc7,0x87,0xf8,0x13,0x0,0x0,0x0,0x0,0x0,0x0};
-			bool cpsOK=size>0x7C263 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGSharedMappedBuffer11withOptionsEP11IGAccelTaskmjj",address,size)==address+0x10924 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK20IGSharedMappedBuffer17getVirtualAddressEv",address,size)==address+0x10B60 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK14IGMappedBuffer20getGPUVirtualAddressEv",address,size)==address+0x13E7C;
-			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x10924),cpsAllocHead,sizeof(cpsAllocHead));
-			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x10B60),cpsCPUHead,sizeof(cpsCPUHead));
-			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x13E7C),cpsGPUHead,sizeof(cpsGPUHead));
-			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x7C208),cpsPointer,sizeof(cpsPointer));
-			cpsOK=cpsOK && !memcmp(reinterpret_cast<void *>(address+0x26683),cpsRelease,sizeof(cpsRelease));
-			patcher.clearError();
+			bool cpsOK = tglCheckCPSHelpers(patcher, index, address, size);
 			KernelPatcher::RouteRequest gucRequests[] {
 				{"__ZN5IGGuC10loadBinaryEb", wrapTGLGuCLoadBinary, orgTGLGuCLoadBinary},
 				{"__ZN5IGGuC12dmaHostToGuCEyjjNS_12IGGucDmaTypeEb", wrapTGLGuCDMA, orgTGLGuCDMA},
@@ -12655,7 +13173,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLGuCDiagnosticRouted", gucOK);
 			// Guard every byte of the replaced straight-line write block; resume
 			// before its first branch. Never relocate a branch or kernel wait call.
-			const uint8_t dmaWrites[] {0x44,0x89,0xAF,0x10,0xC3,0,0,0x44,0x89,0xBF,0,0xC3,0,0,
+			static const uint8_t dmaWrites[] {0x44,0x89,0xAF,0x10,0xC3,0,0,0x44,0x89,0xBF,0,0xC3,0,0,
 				0x89,0xB7,4,0xC3,0,0,0x44,0x89,0xA7,8,0xC3,0,0,0x44,0x89,0x8F,0x0C,0xC3,0,0,
 				0x89,0x8F,0x14,0xC3,0,0};
 			bool dmaWriteOK=false;
@@ -12698,50 +13216,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGInterruptBridge17processInterruptsEv",address,size)==address+0x4B414 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGInterruptBridge17serviceInterruptsERK8IGBitSetILm46EE",address,size)==address+0x4B3A0 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN26IGHardwareCommandStreamer536handleSoftwareContextSwitchInterruptEP22IOInterruptEventSourcei",address,size)==address+0x39C9C;
-                const uint8_t wakeHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x38};
+                static const uint8_t wakeHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x38};
                 hostOK=hostOK && (!adlnDetected || (size>0x2DA26 &&
                  patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator26SafeForceWakeMultithreadedEbjj",address,size)==address+0x2D5AA &&
                  !memcmp(reinterpret_cast<void *>(address+0x2D5AA),wakeHead,sizeof(wakeHead))));
-				const uint8_t loadBlock[] {0x48,0x8B,0x7B,0x10,0x48,0x8B,0x4B,0x28,0x48,0x8B,0x87,0x40,0x12,0x00,0x00,0x31,0xD2,0x8D,0x34,0xD5,0x00,0x00,0x00,0x00,0x03,0x71,0x19,0x8B,0x5C,0xD5,0xC0,0x89,0x1C,0x30,0x8B,0x5C,0xD5,0xC4,0x89,0x5C,0x30,0x04,0x48,0x85,0xD2,0xBA,0x01,0x00,0x00,0x00,0x74,0xDD,0x8B,0x49,0x1D,0xC7,0x04,0x08,0x01,0x00,0x00,0x00,0xF6,0x87,0x72,0x0F,0x00,0x00,0x20};
+				static const uint8_t loadBlock[] {0x48,0x8B,0x7B,0x10,0x48,0x8B,0x4B,0x28,0x48,0x8B,0x87,0x40,0x12,0x00,0x00,0x31,0xD2,0x8D,0x34,0xD5,0x00,0x00,0x00,0x00,0x03,0x71,0x19,0x8B,0x5C,0xD5,0xC0,0x89,0x1C,0x30,0x8B,0x5C,0xD5,0xC4,0x89,0x5C,0x30,0x04,0x48,0x85,0xD2,0xBA,0x01,0x00,0x00,0x00,0x74,0xDD,0x8B,0x49,0x1D,0xC7,0x04,0x08,0x01,0x00,0x00,0x00,0xF6,0x87,0x72,0x0F,0x00,0x00,0x20};
 				auto loadSite=reinterpret_cast<uint8_t *>(address+0x3AA02);
 				hostOK=hostOK && size>0x3AA47 && !memcmp(loadSite,loadBlock,sizeof(loadBlock));
 				if (hostOK) hostOK=patcher.routeMultiple(index,host,arrsize(host),address,size);
-                // Qualify the complete parent bank owner, its native bank0
-                // readers and service consumer before installing retry ownership.
-                if(hostOK) {
-                 const char *symbol="__ZN17IGInterruptBridge22readAndClearInterruptsER8IGBitSetILm46EE";
-                 const uint8_t head[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53};
-                 const uint8_t tail[]={0x44,0x89,0xb8,0x1c,0,0x19,0};
-                 const char *readers[]={
-                  "__ZN17IGInterruptBridge25readAndClearRCSInterruptsER8IGBitSetILm46EEj",
-                  "__ZN17IGInterruptBridge25readAndClearCCSInterruptsER8IGBitSetILm46EEj",
-                  "__ZN17IGInterruptBridge25readAndClearBCSInterruptsER8IGBitSetILm46EEj",
-                  "__ZN17IGInterruptBridge25readAndClearGuCInterruptsER8IGBitSetILm46EEj"};
-                 const uint32_t offsets[]={0x4b0c0,0x4b116,0x4b16c,0x4b1c2};
-                 hostOK=size>0x4B480 &&
-                  patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size)==address+0x4AFF0 &&
-                  !memcmp(reinterpret_cast<void *>(address+0x4AFF0),head,sizeof(head)) &&
-                  !memcmp(reinterpret_cast<void *>(address+0x4B0AF),tail,sizeof(tail));
-                 for(unsigned n=0;n<4 && hostOK;++n) {
-                  const auto method=patcher.solveSymbol<mach_vm_address_t>(index,readers[n],address,size);
-                  hostOK=method==address+offsets[n];xelpIRQBank0[n]=reinterpret_cast<XELPIRQRead>(method);
-                 }
-                 const auto service=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGInterruptBridge17serviceInterruptsERK8IGBitSetILm46EE",address,size);
-                 const auto wake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator22SafeForceWakeInterruptEbj",address,size);
-                 hostOK=hostOK && service==address+0x4B3A0 && wake==address+0x2DA26;
-                 xelpIRQDispatch=reinterpret_cast<decltype(xelpIRQDispatch)>(service);
-                 xelpIRQWake=reinterpret_cast<decltype(xelpIRQWake)>(wake);
-                 patcher.clearError();
-                 KernelPatcher::RouteRequest videoIRQ {symbol,xelpVideoIRQ};
-                 if(hostOK && xelpIRQPrepare()) {
-                  hostOK=patcher.routeMultiple(index,&videoIRQ,1,address,size);
-                  xelpIRQInstalled=hostOK;
-                 }
-                 if(xelpIRQInstalled)if(auto live=OSSerializer::forTarget(nullptr,xelpIRQSerialize)) {
-                  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQState",live);live->release();
-                 }
-                 patcher.clearError();
-                }
+                hostOK = tglInstallHostVideoIRQ(patcher, index, address, size, hostOK);
 
                 if (hostOK && adlnDetected) {
                  KernelPatcher::RouteRequest wake {"__ZN16IntelAccelerator26SafeForceWakeMultithreadedEbjj",wrapAlderLakeNExecutionWake,orgAlderLakeNExecutionWake};
@@ -12760,35 +13243,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				if (hostOK)
 					hostOK=installTGLCSB12(patcher,index,address,size);
 			}
-            if(adlnDetected && checkKernelArgument("-wex-adln-qtrace")) {
-             const char *create="__ZN19IGAccelCommandQueue29createHardwareContextIfNeededEh";
-             const char *process="__ZN19IGAccelCommandQueue20processCommandBufferEjj";
-             const char *pid="__ZNK19IOAccelCommandQueue16getOwningTaskPidEv";
-             const uint8_t createHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xEC,0x18};
-             const uint8_t processHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xFB};
-             const uint8_t pidBody[] {0x55,0x48,0x89,0xE5,0x8B,0x87,0x78,0x05,0,0,0x5D,0xC3};
-             const uint8_t contextStore[] {0x48,0x89,0x83,0xA8,6,0,0};
-             bool ready=hostOK && tglVM.enabled && tglVM.nofault && size>0x3007D &&
-              patcher.solveSymbol<mach_vm_address_t>(index,create,address,size)==address+0x2FD32 &&
-              patcher.solveSymbol<mach_vm_address_t>(index,process,address,size)==address+0x2FF98 &&
-              patcher.solveSymbol<mach_vm_address_t>(index,pid,address,size)==address+0x30072 &&
-              !memcmp(reinterpret_cast<void *>(address+0x2FD32),createHead,sizeof(createHead)) &&
-              !memcmp(reinterpret_cast<void *>(address+0x2FF98),processHead,sizeof(processHead)) &&
-              !memcmp(reinterpret_cast<void *>(address+0x30072),pidBody,sizeof(pidBody)) &&
-              !memcmp(reinterpret_cast<void *>(address+0x2FD88),contextStore,sizeof(contextStore));
-             patcher.clearError();
-             if(ready)adlnQueueTraceProcName=patcher.solveSymbol(KernelPatcher::KernelID,"_proc_name");
-             ready=ready && adlnQueueTraceProcName;patcher.clearError();
-             if(ready) {
-              KernelPatcher::RouteRequest trace[] {
-               {create,adlnQueueTraceCreate,adlnQueueTraceCreateOriginal},
-               {process,adlnQueueTraceProcess,adlnQueueTraceProcessOriginal}
-              };
-              ready=patcher.routeMultiple(index,trace,arrsize(trace),address,size);
-             }
-             patcher.clearError();adlnQueueTraceEnabled=ready;
-             IORegistryEntry::getRegistryRoot()->setProperty("N97QueueTraceReady",ready);
-            }
+            tglInstallAdlnQueueTrace(patcher, index, address, size, adlnDetected, hostOK);
 			tglAlderLakeNContextPublishEnabled=adlnDetected && checkKernelArgument("-wex-adln-ctx-publish") &&
 			 hostOK && tglVM.enabled && !checkKernelArgument("-wex-adln-kernel-ctx");
 			IORegistryEntry::getRegistryRoot()->setProperty("N97ContextPublishReady",tglAlderLakeNContextPublishEnabled);
@@ -12827,7 +13282,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// pending; appending the first copy there silently skips it.
 			// Preserve every native initialization/copy packet, including BBE.
 			const char *blitInit="__Z15blit3d_init_ctxP23IGHardwareBlit3DContext";
-			const uint8_t blitEnd[] {0x48,0xC7,0x83,0x60,0x08,0,0,0,0,0,0x05};
+			static const uint8_t blitEnd[] {0x48,0xC7,0x83,0x60,0x08,0,0,0,0,0,0x05};
 			bool blitInitOK=skuReady && size>0x355D2 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,blitInit,address,size)==address+0x31AFE &&
 				!memcmp(reinterpret_cast<void *>(address+0x3256C),blitEnd,sizeof(blitEnd)) &&
@@ -12859,44 +13314,13 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             }
 			patcher.clearError();
 
-			// Keep IOSurface device-cache allocation uncompressed. The donor
-			// enables it again when the last external display disappears, even
-			// though its CPU-access resolve path can expose compressed bytes.
-			// Apply the policy before allocation, at both native flag writers;
-			// never relabel existing compressed resources or their AUX state.
-			// This complements the userspace ordinary-color allocation policy
-			// and is independent of model, panel presence and connector routing.
-			const uint8_t iosCCSNative[] {0x45,0x88,0xBD,0x74,0x14,0,0,0x45,0x38,0xBD,0x8C,0x12,0,0,
-				0x75,0x0E,0x41,0xF6,0x06,0x20,0x74,0x08,0x41,0xC6,0x85,0x74,0x14,0,0,1};
-			const uint8_t iosCCSInitial[] {0x41,0xC6,0x85,0x74,0x14,0,0,0};
-			const uint8_t iosCCSSetNative[] {0x41,0x8A,0x07,0x41,0x88,0x86,0x74,0x14,0,0};
-			const uint8_t iosCCSSet[] {0x31,0xC0,0x90,0x41,0x88,0x86,0x74,0x14,0,0};
-			const char *iosCCSPlatform="__ZN16IntelAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_";
-			bool iosCCSOK=size>0x959E3 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,iosCCSPlatform,address,size)==address+0x2B4F2 &&
-				!memcmp(reinterpret_cast<void *>(address+0x959D1),"renderCompression",18) &&
-				!memcmp(reinterpret_cast<void *>(address+0x246C3),iosCCSNative,sizeof(iosCCSNative)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x2B872),iosCCSSetNative,sizeof(iosCCSSetNative));
-			patcher.clearError();
-			if (iosCCSOK) {
-				patcher.routeBlock(address+0x246D9,iosCCSInitial,sizeof(iosCCSInitial));
-				iosCCSOK=patcher.getError()==KernelPatcher::Error::NoError &&
-					!memcmp(reinterpret_cast<void *>(address+0x246D9),iosCCSInitial,sizeof(iosCCSInitial));
-				patcher.clearError();
-				if (iosCCSOK) {
-					patcher.routeBlock(address+0x2B872,iosCCSSet,sizeof(iosCCSSet));
-					iosCCSOK=patcher.getError()==KernelPatcher::Error::NoError &&
-						!memcmp(reinterpret_cast<void *>(address+0x2B872),iosCCSSet,sizeof(iosCCSSet));
-					patcher.clearError();
-				}
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSPolicyReady",iosCCSOK);
+			const bool iosCCSOK = tglInstallIOSurfaceCCSPolicy(patcher, index, address, size);
 			// Exact donor's post-relocation aux-state writer, before GPU submission.
 			// Skip installing the wrapper when IOSurface CCS is disabled above.
 			bool auxAlignOK=true;
 			if (!iosCCSOK) {
 				const char *auxState="__ZN15IGAccelResource23fillSurfaceStateAuxInfoEPNS_17ResourceInfoEntryER22SGfxRenderSurfaceState6Intent";
-				const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
+				static const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
 				auxAlignOK=size>0x74078 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,auxState,address,size)==address+0x73FC2 &&
 					!memcmp(reinterpret_cast<void *>(address+0x73FC2),auxHead,sizeof(auxHead));
@@ -12910,302 +13334,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			if (!iosCCSOK) if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
 			}
-			// r119: retain native RCS flush -> stamp order and all runtime address/
-			// notification fields. Gen12 flushes HDC before completion; Linux v6.12
-			// gen12_emit_fini_breadcrumb_rcs also requires DepthStall (1409600907).
-			// The observed RCS hang was at the stamp PIPE_CONTROL after this flush.
-			// r134: use r131's qualified flush ordering as the comparison baseline.
-			// TGL PRM Vol14 UP3/UP4/H35 p51 substitutes HDC flush + state
-			// invalidation for constant-cache invalidation (RCS/CCS hang erratum).
-			// The previous packet already stalls CS. Also invalidate command cache
-			// to cover Vol2a p1129's conditional state-cache redirect requirement.
-			// Keep packet count, scratch writes, ISP, notification and wait fields.
-			// This is a repair candidate; concurrent execution is not yet proven.
-			const uint32_t flushSites[] {0x84E5D,0x85406,0x51A20,0x51A3A};
-			const uint8_t flushFind[][10] {
-				{0x48,0xB8,0x04,0x00,0x00,0x7A,0x21,0x50,0x10,0x40},
-				{0x48,0xB9,0x04,0x00,0x00,0x7A,0x21,0x50,0x10,0x40},
-				{0x48,0xBF,0x04,0x00,0x00,0x7A,0x21,0x52,0x10,0x40},
-				{0x48,0xBB,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x00}};
-			const uint8_t flushReplace[][10] {
-				{0x48,0xB8,0x04,0x02,0x00,0x7A,0x21,0x70,0x10,0x40},
-				{0x48,0xB9,0x04,0x02,0x00,0x7A,0x21,0x70,0x10,0x40},
-				{0x48,0xBF,0x04,0x02,0x00,0x7A,0x21,0x72,0x10,0x50},
-				{0x48,0xBB,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x20}};
-			bool flushOK=size>0x85410 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain18commitStampCommandEjb",address,size)==address+0x84DC8 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain10writeFlushEv",address,size)==address+0x853A6;
-			const uint8_t renderFlushWait[] {0x48,0xBB,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x00};
-			flushOK=flushOK &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent",address,size)==address+0x4F1F0 &&
-				!memcmp(reinterpret_cast<void *>(address+0x51A3A),renderFlushWait,sizeof(renderFlushWait));
-			for (size_t n=0;flushOK && n<arrsize(flushSites);++n)
-				flushOK=!memcmp(reinterpret_cast<void *>(address+flushSites[n]),flushFind[n],sizeof(flushFind[n]));
-			patcher.clearError();
-			for (size_t n=0;flushOK && n<arrsize(flushSites);++n) {
-				auto site=reinterpret_cast<uint8_t *>(address+flushSites[n]);
-				KernelPatcher::LookupPatch patch {currentGraphics,flushFind[n],flushReplace[n],sizeof(flushFind[n]),1};
-				patcher.applyLookupPatch(&patch,site,sizeof(flushFind[n])+1);
-				flushOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,flushReplace[n],sizeof(flushReplace[n]));
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSCompletionFlushReady",flushOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassFlushReady",flushOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassTileFlushReady",flushOK);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassConstAlternativeReady",flushOK);
-			// The outer RCS completion emitter is separate from the render-pass
-			// emitter above. Apply the same Vol14 constant-cache alternative to
-			// its stamp and optional notification packets on the qualified Tahoe
-			// host-scheduler target. Preserve native GTT mode, stamp address/value,
-			// notification selection, packet lengths and the preceding CS stall.
-			const bool tahoeTrialScope=!adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
-				(XELP::kernelOS(version)==XELP::OS::Tahoe);
-			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
-			// Linux applies Wa_18022495364 to TGL, ADL and RPL (Xe_LP 12.00-12.10).
-			// The ADL-N backend also drives ADL-P/RPL-P; on by default on the same
-			// Tahoe host-scheduler target, -wex-no-adln-ctx-invalidate turns it off.
-			// That scope only enables the indirect trial and declines an unqualified
-			// image per context instead of failing construction.
-			const bool adlnContextCacheRequested=adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
-				(XELP::kernelOS(version)==XELP::OS::Tahoe) && !checkKernelArgument("-wex-no-adln-ctx-invalidate");
-			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
-			TGLContextCache::soft()=adlnContextCacheRequested;
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
-			// Preserve native submission; use its one-shot force-restore flag only
-			// for a witnessed equal-tail resubmission of the active first item.
-			const uint8_t sameTailFlag[] {0x41,0x80,0xBD,0xC9,0,0,0,0,0x74,0x10,0x41,0xC6,0x85,0xC9,0,0,0,0,0x89,0xC8,0x83,0xC8,0x04,0x89,0x45,0xC0};
-			tglSameTailEnabled=tahoeTrialScope && hostOK && size>0x7C5D7 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGHardwareContext14updateRingTailEj",address,size)==address+0x7C5B6 &&
-				!memcmp(reinterpret_cast<void *>(address+0x3A7B6),sameTailFlag,sizeof(sameTailFlag));
-			patcher.clearError();
-			tglSameTailRestoreEnabled=tglSameTailEnabled && !(tglTahoeDisabledTrials&4);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailRestoreReady",tglSameTailRestoreEnabled);
-			// The public TGL register definition identifies colored GSYNC at
-			// B0A0[2]. Restrict this repair trial to the physical TGL B0 target,
-			// exact Tahoe kernel/donor and the qualified strong-UC mapping.
-			const bool gsyncQualified=tglSameTailEnabled && tglMMIOUCReady &&
-				xeProfile.identity==0x9A498086 && xeProfile.revision==1 && !xeProfile.overridden();
-			tglGSYNCObserveReady=gsyncQualified;
-			tglGSYNCReady=gsyncQualified && !(tglTahoeDisabledTrials&8);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLGSYNCDisableReady",tglGSYNCReady);
-			if(tglGSYNCObserveReady)if(auto live=OSSerializer::forTarget(nullptr,tglGSYNCSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLGSYNCLive",live);live->release();
-			}
-			if(tglSameTailEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglSameTailSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailLive",live);live->release();
-			}
-			bool completionCacheOK=!completionCacheRequested;
-			if(completionCacheRequested) {
-				const uint32_t completionCacheSites[] {0x84EA4,0x84F95};
-				const uint8_t completionCacheFind[][10] {
-					{0x48,0xB8,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x01},
-					{0x48,0xB8,0x04,0x00,0x00,0x7A,0x18,0x05,0x00,0x01}};
-				const uint8_t completionCacheReplace[][10] {
-					{0x48,0xB8,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x21},
-					{0x48,0xB8,0x04,0x02,0x00,0x7A,0x14,0x05,0x00,0x21}};
-				completionCacheOK=hostOK && flushOK && size>0x84FD5 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain18commitStampCommandEjb",address,size)==address+0x84DC8;
-				for(size_t n=0;completionCacheOK && n<arrsize(completionCacheSites);++n)
-					completionCacheOK=!memcmp(reinterpret_cast<void *>(address+completionCacheSites[n]),completionCacheFind[n],sizeof(completionCacheFind[n]));
-				patcher.clearError();
-				for(size_t n=0;completionCacheOK && n<arrsize(completionCacheSites);++n) {
-					auto site=reinterpret_cast<uint8_t *>(address+completionCacheSites[n]);
-					KernelPatcher::LookupPatch patch {currentGraphics,completionCacheFind[n],completionCacheReplace[n],sizeof(completionCacheFind[n]),1};
-					patcher.applyLookupPatch(&patch,site,sizeof(completionCacheFind[n])+1);
-					completionCacheOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,completionCacheReplace[n],sizeof(completionCacheReplace[n]));
-				}
-				patcher.clearError();
-			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeRequested",completionCacheRequested);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeReady",completionCacheRequested && completionCacheOK);
-			const char *cpsRestore="__ZN17IGHardwareContext20restoreFromSafeImageEv";
-			const uint8_t cpsRestoreHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
-			const uint8_t cpsRestoreCall[] {0x4c,0x89,0xef,0xe8,0x61,0x2,0x0,0x0};
-			cpsOK=cpsOK && patcher.solveSymbol<mach_vm_address_t>(index,cpsRestore,address,size)==address+0x7C392 &&
-				!memcmp(reinterpret_cast<void *>(address+0x7C392),cpsRestoreHead,sizeof(cpsRestoreHead)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x7C129),cpsRestoreCall,sizeof(cpsRestoreCall));
-			cpsOK=cpsOK && hostOK && gucOK;
-			patcher.clearError();
-			if(cpsOK) {
-				const uint8_t find[] {0x83,0xC8,1},replace[] {0x83,0xC8,5};
-				auto site=reinterpret_cast<uint8_t *>(address+0x7C21D);
-				KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
-				patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
-				cpsOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
-				if(cpsOK) {tglCPSAllocate=address+0x10924;tglCPSCPUAddress=address+0x10B60;tglCPSGPUAddress=address+0x13E7C;}
-			}
-			patcher.clearError();
-			if(cpsOK) {
-				tglCPSRestoreCaller=address+0x7C131;
-				KernelPatcher::RouteRequest route[] {{cpsRestore,tglCPSRestore,tglCPSRestoreOriginal}};
-				cpsOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
-			}
-			patcher.clearError();
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
-			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
-			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
-			bool contextCacheOK=!contextCacheRequested;
-			if(contextCacheRequested) {
-				const char *init="__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh";
-				const uint8_t contextCacheHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
-				contextCacheOK=cpsOK && hostOK && size>0x7C350 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,init,address,size)==address+0x7B9D4 &&
-					!memcmp(reinterpret_cast<void *>(address+0x7B9D4),contextCacheHead,sizeof(contextCacheHead));
-				patcher.clearError();
-				if(contextCacheOK) {
-					KernelPatcher::RouteRequest route[] {{init,tglContextCacheInit,tglContextCacheInitOriginal}};
-					contextCacheOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
-				}
-				patcher.clearError();
-			}
-			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
-			// Render compression goes through a per-task aux table, and the donor asks the engine to drop its
-			// cached entries only after it has changed a mapping. Linux also asks on every context restore, in the
-			// batch this plugin already installs for Wa_18022495364. -wex-no-aux-inv leaves that out.
-			tglContextAuxInvalidate=tglContextCacheEnabled && !checkKernelArgument("-wex-no-aux-inv");
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextAuxInvalidateSelected",tglContextAuxInvalidate);
-			// Linux programs Wa_1409804808 and Wa_14010229206 on every integrated Xe-LP, and Wa_1607297627 on
-			// Tiger Lake, Rocket Lake and Alder Lake-P, which there covers Alder Lake-N and Raptor Lake-P. The donor
-			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
-			// -wex-no-engine-wa keeps the donor's values.
-			tglEngineWorkarounds=cpsOK && xeProfile.family!=XELP::Family::Unknown && !checkKernelArgument("-wex-no-engine-wa");
-			tglContextHiZSampler=tglEngineWorkarounds && !checkKernelArgument("-wex-no-ctx-hiz-wa");
-			tglEngineSemaphoreIdle=tglEngineWorkarounds && xeProfile.family!=XELP::Family::AlderLakeS &&
-				xeProfile.family!=XELP::Family::RaptorLakeS;
-			// The second render ring is in use outside Tiger Lake only with -wex-parallel-compute; on Tiger Lake
-			// its register stays with the donor's own workaround mask.
-			tglEngineSemaphoreIdleCompute=tglEngineSemaphoreIdle && xeProfile.family!=XELP::Family::TigerLake &&
-				checkKernelArgument("-wex-parallel-compute");
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLEngineWorkaroundsSelected",
-				uint32_t(tglEngineWorkarounds)|uint32_t(tglEngineSemaphoreIdle)<<1|uint32_t(tglEngineSemaphoreIdleCompute)<<2,32);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheIndirectReady",tglContextCacheEnabled);
-			if(tglContextCacheEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglContextCacheSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheLive",live);live->release();
-			}
-			// The native RCS constructor initializes RPCS with ENABLE alone.
-			// Request the one TGL slice explicitly, as intel_sseu_make_rpcs does.
-			// Preserve the instruction and native ownership/lifetime of the image.
-			tglRPCSPowerReady=gsyncQualified && !(tglTahoeDisabledTrials&16) && contextCacheOK && cpsOK && hostOK && size>0x7C331 &&
-				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGHardwareContext15initWithOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",address,size)==address+0x7B9D4 &&
-				!memcmp(reinterpret_cast<void *>(address+0x7C313),TGLRPCS::Find,sizeof(TGLRPCS::Find));
-			patcher.clearError();
-			if(tglRPCSPowerReady) {
-				KernelPatcher::LookupPatch patch {currentGraphics,TGLRPCS::Find,TGLRPCS::Replace,sizeof(TGLRPCS::Find),1};
-                patcher.applyLookupPatch(&patch,reinterpret_cast<uint8_t *>(address+0x7C313),sizeof(TGLRPCS::Find)+1);
-				tglRPCSPowerReady=patcher.getError()==KernelPatcher::Error::NoError &&
-				 !memcmp(reinterpret_cast<void *>(address+0x7C313),TGLRPCS::Replace,sizeof(TGLRPCS::Replace));
-			}
-			patcher.clearError();
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRPCSFullSliceReady",tglRPCSPowerReady);
-			if(tglRPCSPowerReady)if(auto live=OSSerializer::forTarget(nullptr,tglRPCSPowerSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLRPCSPowerLive",live);live->release();
-			}
-            if(adlnDetected && checkKernelArgument("-wex-adln-golden-source")) {
-             adlnOwnedGoldenEnabled=cpsOK && !checkKernelArgument("-wex-adln-kernel-ctx") && !checkKernelArgument("-wex-adln-golden-raw");
-             IORegistryEntry::getRegistryRoot()->setProperty("N97OwnedGoldenReady",adlnOwnedGoldenEnabled);
-             if(auto capture=OSSerializer::forTarget(nullptr,adlnOwnedGoldenSerialize)) {
-              IORegistryEntry::getRegistryRoot()->setProperty("N97OwnedGoldenCapture",capture);capture->release();
-             }
-            }
-			if(adlnDetected && checkKernelArgument("-wex-adln-golden-raw")) {
-				const char *copy="__ZNK17IGHardwareContext16copyContextImageEPP24IOBufferMemoryDescriptorS2_";
-				const uint8_t head[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
-				bool ok=cpsOK && patcher.solveSymbol<mach_vm_address_t>(index,copy,address,size)==address+0x7C762 &&
-				 !memcmp(reinterpret_cast<void *>(address+0x7C762),head,sizeof(head));
-				patcher.clearError();
-				if(ok) {
-				 tglAlderLakeNGoldenCopyCaller=address+0x25E60;
-				 KernelPatcher::RouteRequest route[] {{copy,tglAlderLakeNGoldenCopy,tglAlderLakeNGoldenCopyOriginal}};
-				 ok=patcher.routeMultiple(index,route,arrsize(route),address,size);
-				}
-				patcher.clearError();tglAlderLakeNGoldenEnabled=ok;
-				IORegistryEntry::getRegistryRoot()->setProperty("N97GoldenRawReady",ok);
-				if(auto live=OSSerializer::forTarget(nullptr,tglAlderLakeNGoldenSerialize)) {
-				 IORegistryEntry::getRegistryRoot()->setProperty("N97GoldenRawCapture",live);live->release();
-				}
-			}
-			if(auto live=OSSerializer::forTarget(nullptr,tglCPSSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeLive",live);live->release();
-			}
-			if(auto live=OSSerializer::forTarget(nullptr,tglContextWaSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextWorkaroundsLive",live);live->release();
-			}
-			if(auto live=OSSerializer::forTarget(nullptr,tglEarlyReadSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLEarlyReadLive",live);live->release();
-			}
-			if(auto live=OSSerializer::forTarget(nullptr,tglStateRedirectSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLStateRedirectLive",live);live->release();
-			}
-			// Reserve the extra two DWORDs through the same virtual space method
-			// used by waitForSpace. Validate the native dispatch/pending-bit contract.
-			const char *tlbSpace="__ZN24IGHardwareRingBufferMain16getFlushTLBSpaceEv";
-			const char *tlbWrite="__ZN24IGHardwareRingBufferMain13writeFlushTLBEv";
-			const char *ringWrite="__ZN20IGHardwareRingBuffer11writeBufferEPjj";
-			const uint8_t tlbSpaceBody[] {0x55,0x48,0x89,0xE5,0x48,0x8B,0x47,0x10,0x0F,0xBA,0xA0,0xD6,0x0F,0,0,0x10,0xB9,6,0,0,0,0xB8,0x0C,0,0,0,0x0F,0x43,0xC1,0x5D,0xC3};
-			const uint8_t tlbWriteHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
-			const uint8_t tlbReserveCall[] {0xFF,0x90,0x50,0x01,0,0,0x44,0x01,0xE8,0x41,0xC6,0x46,0x6D,1};
-			const uint8_t tlbPendingCall[] {0x48,0xF7,0xD6,0x48,0x21,0xF7,0x48,0x89,0xBC,0xD0,0x40,0x13,0,0,0x49,0x8B,0x06,0x4C,0x89,0xF7,0xFF,0x90,0x60,1,0,0};
-			bool tlbPreparserOK=hostOK && size>0x8520E &&
-				patcher.solveSymbol<mach_vm_address_t>(index,tlbSpace,address,size)==address+0x8507C &&
-				patcher.solveSymbol<mach_vm_address_t>(index,tlbWrite,address,size)==address+0x8509C &&
-				patcher.solveSymbol<mach_vm_address_t>(index,ringWrite,address,size)==address+0x41E7A &&
-				!memcmp(reinterpret_cast<void *>(address+0x8507C),tlbSpaceBody,sizeof(tlbSpaceBody)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x8509C),tlbWriteHead,sizeof(tlbWriteHead)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x4177C),tlbReserveCall,sizeof(tlbReserveCall)) &&
-				!memcmp(reinterpret_cast<void *>(address+0x41ECA),tlbPendingCall,sizeof(tlbPendingCall));
-			patcher.clearError();
-			if(tlbPreparserOK) {
-				tglRCSWriteBuffer=address+0x41E7A;
-				KernelPatcher::RouteRequest tlb[] {
-					{tlbSpace,tglRCSTLBSpace,tglOrigRCSTLBSpace},
-					{tlbWrite,tglRCSTLBWrite,tglOrigRCSTLBWrite}
-				};
-				tlbPreparserOK=patcher.routeMultiple(index,tlb,arrsize(tlb),address,size);
-			}
-			patcher.clearError();
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSTLBPreparserReady",tlbPreparserOK);
-			if(auto live=OSSerializer::forTarget(nullptr,tglRCSTLBSerialize)) {
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSTLBPreparserLive",live);live->release();
-			}
-            const char *baseSpace="__ZN20IGHardwareRingBuffer16getFlushTLBSpaceEv";
-            const char *baseWrite="__ZN20IGHardwareRingBuffer13writeFlushTLBEv";
-            const char *semCanUse="__ZN20IGHardwareRingBuffer23canUseSemaphoreWaitPollEi";
-            const char *semSpace="__ZN20IGHardwareRingBuffer25getSemaphoreWaitPollSpaceEi";
-            const char *semCommand="__ZN20IGHardwareRingBuffer30insertSemaphoreWaitPollCommandEPKN26IGSemaphoreWaitBufferQueue29SemaphoreWaitBufferDescriptorE";
-            const uint8_t baseSpaceBody[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x47,0x10,0x8b,0x80,0xd6,0x0f,0,0,0xc1,0xe8,0x10,0x83,0xe0,1,0x8d,0x0c,0x80,0xb8,5,0,0,0,1,0xc8,0x5d,0xc3};
-            const uint8_t semSpaceBody[] {0x55,0x48,0x89,0xe5,0xe8,0x3f,0xfe,0xff,0xff,0x0f,0xb6,0xc0,0x8d,0x04,0xc0,0x5d,0xc3};
-            const uint8_t semCommandHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30};
-            const uint8_t semMapCall[] {0xe8,0xcf,0x41,1,0,0x48,0x85,0xc0,0x74,0x0f,0x48,0x89,0xdf,0x48,0x89,0xc6,0xe8,0x45,0xfe,0xff,0xff};
-            bool semaphoreTLBOK=tlbPreparserOK &&
-             patcher.solveSymbol<mach_vm_address_t>(index,baseSpace,address,size)==address+0x428EC &&
-             patcher.solveSymbol<mach_vm_address_t>(index,baseWrite,address,size)==address+0x4290C &&
-             patcher.solveSymbol<mach_vm_address_t>(index,semCanUse,address,size)==address+0x42440 &&
-             patcher.solveSymbol<mach_vm_address_t>(index,semSpace,address,size)==address+0x425F8 &&
-             patcher.solveSymbol<mach_vm_address_t>(index,semCommand,address,size)==address+0x4249E &&
-             !memcmp(reinterpret_cast<void *>(address+0x428EC),baseSpaceBody,sizeof(baseSpaceBody)) &&
-             !memcmp(reinterpret_cast<void *>(address+0x4290C),tlbWriteHead,sizeof(tlbWriteHead)) &&
-             !memcmp(reinterpret_cast<void *>(address+0x425F8),semSpaceBody,sizeof(semSpaceBody)) &&
-             !memcmp(reinterpret_cast<void *>(address+0x4249E),semCommandHead,sizeof(semCommandHead)) &&
-             !memcmp(reinterpret_cast<void *>(address+0x42644),semMapCall,sizeof(semMapCall));
-            patcher.clearError();
-            if(semaphoreTLBOK) {
-             tglCanUseSemaphore=address+0x42440;
-             KernelPatcher::RouteRequest routes[] {
-              {baseSpace,tglBaseTLBSpace,tglOrigBaseTLBSpace},
-              {baseWrite,tglBaseTLBWrite,tglOrigBaseTLBWrite},
-              {semSpace,tglSemaphoreSpace},
-              {semCommand,tglSemaphoreCommand,tglOrigSemaphoreCommand}
-             };
-             semaphoreTLBOK=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
-            }
-            patcher.clearError();
-            IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBReady",semaphoreTLBOK);
-            if(auto live=OSSerializer::forTarget(nullptr,tglSemaphoreSerialize)) {
-             IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBLive",live);live->release();
-            }
+			const bool gsyncTargetMatch = xeProfile.identity==0x9A498086 && xeProfile.revision==1 && !xeProfile.overridden();
+			bool flushOK=false, completionCacheOK=false, contextCacheOK=false;
+			tglPatchFlushCPSContextAndRPCS(patcher, index, address, size, currentGraphics, adlnDetected, hostOK, gucOK, cpsOK, xeProfile.family, gsyncTargetMatch, flushOK, completionCacheOK, contextCacheOK);
+			bool tlbPreparserOK=false, semaphoreTLBOK=false;
+			tglInstallTLBPreparserAndSemaphore(patcher, index, address, size, hostOK, tlbPreparserOK, semaphoreTLBOK);
 			// r120: failure-path capture only. Native dumpBatchBuffer is a stub;
 			// reuse the native pending resource cache and saved debug registers.
 			const char *hangDump="__ZN20IGHardwareRingBuffer14dumpRingBufferER14debugRegisters";
-			const uint8_t hangHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+			static const uint8_t hangHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
 			bool hangOK=tglVM.nofault && size>0x46780 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,hangDump,address,size)==address+0x4657C &&
 				!memcmp(reinterpret_cast<void *>(address+0x4657C),hangHead,sizeof(hangHead));
@@ -13217,26 +13354,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				hangOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
-            // Exact failure-only wake call. Native STOP, wake ownership and all
-            // other callers remain unchanged; no instrumentation in normal submits.
-            if((XELP::kernelOS(version)==XELP::OS::Tahoe)) {
-             const uint8_t before[] {0x41,0x89,0xf6,0x49,0x89,0xff,0x48,0x8b,0x7f,0x10,0xbe,1,0,0,0,0xba,7,0,0,0,0xe8,0x8e,0x22,0xfd,0xff};
-             const uint8_t stop[] {0x42,0xc7,0x04,0x20,1,0,1,0};
-             bool ok=hangOK && size>0x569c6 &&
-              patcher.solveSymbol<mach_vm_address_t>(index,"__ZN11IGScheduler19haltCommandStreamerE10IGHwCsType",address,size)==address+0x56978 &&
-              !memcmp(reinterpret_cast<void *>(address+0x56983),before,sizeof(before)) &&
-              !memcmp(reinterpret_cast<void *>(address+0x569be),stop,sizeof(stop));
-             const int64_t delta=reinterpret_cast<int64_t>(tglHangPreStopBridge)-static_cast<int64_t>(address+0x5699c);
-             ok=ok && delta>=INT32_MIN && delta<=INT32_MAX;
-             if(ok) {
-              uint8_t call[5] {0xe8};const auto relative=static_cast<int32_t>(delta);memcpy(call+1,&relative,4);
-              patcher.clearError();patcher.routeBlock(address+0x56997,call,sizeof(call));
-              ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x56997),call,sizeof(call));
-             }
-             patcher.clearError();tglHangPreStopReady=ok;
-             IORegistryEntry::getRegistryRoot()->setProperty("TGLHangPreStopReady",ok);
-             IORegistryEntry::getRegistryRoot()->setProperty("TGLSubmitHistoryReady",ok && tglSameTailEnabled);
-            }
+            tglPatchHangPreStop(patcher, index, address, size, hangOK);
 
 			// r123: the TGL caller loops reset -> extra stamp -> one-second wait
 			// while IOAccel holds its recovery locks. A stopped consumer fills its
@@ -13252,51 +13370,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			bool recoveryOK=!recoveryRequested;
 			if (recoveryRequested) {
 				const char *recovery="__ZN18IGAccelFIFOChannel22resetHardwareAndReplayEv";
-				const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10,
-					0x49,0x89,0xFF,0x4C,0x8B,0xB7,0x30,0x01,0,0,0x4C,0x8D,0x65,0xDC,0x49,0x8B,0x06,
-					0x49,0x8B,0x76,0x20,0x48,0x8B,0x9E,0xB8,0,0,0};
-				const uint8_t failedAndResume[] {0xFF,0x83,0x7C,0x01,0,0,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,
-					0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0};
-				const uint8_t successDispatch[] {0xFF,0x90,0x68,0x01,0,0,0x84,0xC0,0x74,0x09,0x41,0x80,0x7E,0x40,0,0x74,0x08,0xEB,0x72};
-				const uint8_t successPath[] {0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0,
-					0x48,0x85,0xDB,0x74,0xDA,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x80,0x03,0,0,0x8B,0x73,0x20,0x48,0x8B,0x07,0xFF,0x90,0xD8,0x01,0,0,
-					0x48,0x89,0xDF,0xE8,0xFD,0xF9,0xFF,0xFF,0x8B,0x93,0x78,0x01,0,0,0x48,0x8D,0x75,0xD8,0x4C,0x89,0xF7,0xB9,0x40,0x42,0x0F,0,
-					0xE8,0xC4,0x54,0xFF,0xFF,0x84,0xC0,0x74,0xA0,0xFF,0x83,0x7C,0x01,0,0,0xEB,0x98};
-				const uint8_t submitHead[] {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x10,0x48,0x8B,0x47,0x18,0xF6,0x80,0x78,0x0C,0,0,0x02};
-				const auto submit=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18IGAccelFIFOChannel18submitStampCommandEv",address,size);
-				// hostOK already qualifies and routes this exact sleep entry. Call
-				// the routed entry, as the native E8 does, not the saved trampoline.
-				recoveryOK=hostOK && orgTGLHostWait && size>0xDF668 && submit==address+0x4C506 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,recovery,address,size)==address+0x4CA1E &&
-					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",address,size)==address+0x43576 &&
-					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN12IGScheduler56resumeEv",address,size)==address+0x3906C &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CA1E),head,sizeof(head)) &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume)) &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CA4C),successDispatch,sizeof(successDispatch)) &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CAD1),successPath,sizeof(successPath)) &&
-					!memcmp(reinterpret_cast<void *>(submit),submitHead,sizeof(submitHead));
-				patcher.clearError();
-				if (recoveryOK) {
-					// The native poll loses GDRST bits above bit 7 and can wait
-					// indefinitely. Preserve its exact entry/continuations, including
-					// scratch handling, and use its false exit on an unacknowledged reset.
-					static const uint8_t poll[] {0x4c,0x8d,0x3d,0xff,0x84,0x10,0x00,0x8b,0x88,0x1c,0x94,0x00,0x00,0x0f,0xb6,0xd9,0x8b,0x88,0xc4,0xce,0x00,0x00,0xf6,0xc1,0x01,0x74,0x1d,0xc7,0x80,0x00,0x41,0x00,0x00,0xb1,0xb1,0xf0,0xf0,0xc7,0x80,0x04,0x41,0x00,0x00,0xb2,0xb2,0xf0,0xf0,0x83,0xe1,0xfe,0x89,0x88,0xc4,0xce,0x00,0x00,0x4c,0x89,0xff,0x31,0xf6,0xba,0x0a,0x00,0x00,0x00,0xb9,0xe8,0x03,0x00,0x00,0xe8,0x00,0x00,0x00,0x00,0x31,0xff,0xe8,0x00,0x00,0x00,0x00,0x41,0x85,0x5c,0x24,0x70};
-					const int64_t delta=reinterpret_cast<int64_t>(tglResetPollBridge)-static_cast<int64_t>(address+0x43783);
-					static const uint8_t done[]{0x49,0x8b,0x44,0x24,0x50,0x75,0xa8,0xc7,0x80,0x08,0x4a,0,0,0,0,4,0};
-					// The two imported call displacements are relocated by the kernel.
-					recoveryOK=!memcmp(reinterpret_cast<void *>(address+0x4377e),poll,72) &&
-						!memcmp(reinterpret_cast<void *>(address+0x437ca),poll+76,3) &&
-						!memcmp(reinterpret_cast<void *>(address+0x437d1),poll+83,5) &&
-						!memcmp(reinterpret_cast<void *>(address+0x437d6),done,sizeof(done)) && delta>=INT32_MIN && delta<=INT32_MAX;
-					if(recoveryOK) {
-						tglResetPollSuccess=address+0x437dd;tglResetPollFailure=address+0x4374c;
-						uint8_t branch[5]{0xe9};const auto relative=static_cast<int32_t>(delta);memcpy(branch+1,&relative,4);
-						patcher.routeBlock(address+0x4377e,branch,sizeof(branch));
-						recoveryOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x4377e),branch,sizeof(branch));
-					}
-					patcher.clearError();
-				}
-				IORegistryEntry::getRegistryRoot()->setProperty("TGLResetDomainPollReady",recoveryOK);
+				mach_vm_address_t submit = 0;
+				recoveryOK = tglPrepareRecoveryResetPoll(patcher, index, address, size, recovery, hostOK, bool(orgTGLHostWait), submit);
 				if (recoveryOK) {
 					tglRecoveryStamp={reinterpret_cast<TGLRecovery::SubmitStamp>(submit),reinterpret_cast<TGLRecovery::WaitStamp>(address+0x41FE4)};
 					KernelPatcher::RouteRequest hook[] {{recovery,wrapTGLRecovery,orgTGLRecovery}};
